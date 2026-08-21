@@ -1,0 +1,4 @@
+interface:
+  display_name: "AIPM SD3 现代提示词导演"
+  short_description: "生成 SD3 与现代 T5 生图模型的专业英文提示词"
+  default_prompt: "Use $aipm-sd3-modern to create a professional SD3 prompt."

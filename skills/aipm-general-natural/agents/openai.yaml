@@ -1,0 +1,4 @@
+interface:
+  display_name: "AIPM 通用自然语言导演"
+  short_description: "生成结构完整且具专业画质设计的通用自然语言生图提示词"
+  default_prompt: "Use $aipm-general-natural to create a professional image-generation prompt."

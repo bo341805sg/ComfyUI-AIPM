@@ -1,0 +1,4 @@
+interface:
+  display_name: "AIPM Krea 2 摄影导演"
+  short_description: "生成具备专业构图、光线与材质控制的 Krea 2 提示词"
+  default_prompt: "Use $aipm-krea2-director to create a Krea 2 prompt."

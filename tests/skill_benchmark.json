@@ -1,0 +1,21 @@
+{
+  "date": "2026-08-17",
+  "scenario": "Illustrious rain-night detective, no reference images",
+  "remote_model": "Qwen3.8-27B-Uncensored-Q5_K_M.gguf",
+  "before": {
+    "prompt_id": "58c523df-cf5d-4d9a-b22c-ce03703ca50f",
+    "score": 4,
+    "max_score": 6,
+    "numeric_emphasis_count": 0,
+    "audited_quality_feature_count": 0
+  },
+  "after": {
+    "prompt_id": "393f8239-ea3b-4f51-839f-cfecbc5f59df",
+    "score": 6,
+    "max_score": 6,
+    "numeric_emphasis_count": 3,
+    "audited_quality_feature_count": 7
+  },
+  "delta": 2,
+  "critical_regressions": []
+}

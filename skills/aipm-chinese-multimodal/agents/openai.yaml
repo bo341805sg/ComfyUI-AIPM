@@ -1,0 +1,4 @@
+interface:
+  display_name: "AIPM 中文多模态导演"
+  short_description: "生成具备多图参考、画质与视觉重点设计的中文生图提示词"
+  default_prompt: "Use $aipm-chinese-multimodal to create a Chinese multimodal image prompt."

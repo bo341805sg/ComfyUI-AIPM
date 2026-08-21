@@ -1,0 +1,4 @@
+interface:
+  display_name: "AIPM FLUX 视觉导演"
+  short_description: "生成具备专业摄影、光影与材质设计的 FLUX 自然语言提示词"
+  default_prompt: "Use $aipm-flux-natural to create a professional FLUX prompt."

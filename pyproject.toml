@@ -1,0 +1,13 @@
+[project]
+name = "comfyui-aipm"
+version = "1.0.0"
+description = "AI Prompt Master image and video prompt nodes for ComfyUI"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "bo341805sg" }]
+dependencies = []
+classifiers = ["Operating System :: OS Independent"]
+
+[tool.comfy]
+PublisherId = "bo341805sg"
+DisplayName = "ComfyUI-AIPM"

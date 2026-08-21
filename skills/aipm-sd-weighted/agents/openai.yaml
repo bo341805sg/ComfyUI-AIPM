@@ -1,0 +1,4 @@
+interface:
+  display_name: "AIPM SD 加权提示词导演"
+  short_description: "生成适配 SD1 与 SDXL 的专业英文加权提示词"
+  default_prompt: "Use $aipm-sd-weighted to create a weighted Stable Diffusion prompt."
