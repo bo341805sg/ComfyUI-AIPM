@@ -55,7 +55,7 @@ class PromptAssistantTests(unittest.TestCase):
         self.assertIn('modification.computeSize = (width) => [width, 54]', ui)
         self.assertIn('element.style.resize = "none"', ui)
         self.assertIn("configureStableNodeLayout(this)", ui)
-        self.assertIn("grid-template-columns:minmax(0,1fr) minmax(0,1fr)", ui)
+        self.assertIn("grid-template-columns:repeat(3,minmax(0,1fr))", ui)
         self.assertIn("box-sizing:border-box;min-width:0;width:100%", ui)
         for node in (nodes.AIPMImagePrompt, nodes.AIPMVideoPromptCore):
             self.assertNotIn("独立执行令牌", node.INPUT_TYPES().get("optional", {}))
@@ -66,6 +66,15 @@ class PromptAssistantTests(unittest.TestCase):
         self.assertIn("node.onExecuted = nodeExecuted", ui)
         self.assertIn("node.onSerialize = serialize", ui)
         self.assertIn("previousResult.value = String(this.properties.aipm_previous_result)", ui)
+
+    def test_all_prompt_nodes_have_offline_cached_output_button(self):
+        ui = (ROOT / "web" / "aipm_ui.js").read_text(encoding="utf-8")
+        self.assertIn('cacheButton.textContent = "输出缓存"', ui)
+        self.assertIn("actions.append(button, reviseButton, cacheButton)", ui)
+        self.assertIn("grid-template-columns:repeat(3,minmax(0,1fr))", ui)
+        self.assertIn('setStatus("正在从本地缓存重新输出，不调用远程服务……")', ui)
+        self.assertIn('currentAction === "cache"', ui)
+        self.assertIn('"AIPMImagePrompt", "AIPMVideoPrompt", "AIPMPromptRefinement"', ui)
 
     def test_video_result_is_immediately_written_to_linked_cinetimeline(self):
         ui = (ROOT / "web" / "aipm_ui.js").read_text(encoding="utf-8")

@@ -1,7 +1,7 @@
 import { app } from "../../../scripts/app.js";
 import { api } from "../../../scripts/api.js";
 
-const VERSION = 37;
+const VERSION = 38;
 const AIPM_MIN_WIDTH = 480;
 const REVISION_MARKER = "__AIPM_REVISION_V1__";
 const RUN_MARKER = "__AIPM_RUN_V1__";
@@ -299,7 +299,7 @@ function installGeneratePanel(node) {
   root.className = "aipm-generate-panel";
   root.innerHTML = `<style>
     .aipm-generate-panel{box-sizing:border-box;width:100%;padding:7px 4px 11px;font:12px Inter,system-ui,sans-serif}
-    .aipm-generate-panel .actions{display:grid;width:100%;min-width:0;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:6px}
+    .aipm-generate-panel .actions{display:grid;width:100%;min-width:0;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px}
     .aipm-generate-panel button{box-sizing:border-box;min-width:0;width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:7px 10px;border:1px solid #59759d;border-radius:6px;background:#293b55;color:#f3f7ff;font-weight:650;cursor:pointer}
     .aipm-generate-panel button.secondary{background:#3a334e;border-color:#75638f}
     .aipm-generate-panel button.clear{margin-top:6px;padding:4px 8px;background:transparent;border-color:#536273;color:#b9c5d4;font-weight:500}
@@ -314,6 +314,10 @@ function installGeneratePanel(node) {
   reviseButton.type = "button";
   reviseButton.className = "secondary";
   reviseButton.textContent = isRefinement ? "根据新意见继续细化" : "按修改意见优化";
+  const cacheButton = document.createElement("button");
+  cacheButton.type = "button";
+  cacheButton.className = "secondary";
+  cacheButton.textContent = "输出缓存";
   const clearButton = document.createElement("button");
   clearButton.type = "button";
   clearButton.className = "clear";
@@ -323,7 +327,7 @@ function installGeneratePanel(node) {
   status.textContent = "仅执行当前节点，不触发工作流其他生成节点。";
   const actions = document.createElement("div");
   actions.className = "actions";
-  actions.append(button, reviseButton);
+  actions.append(button, reviseButton, cacheButton);
   root.append(status, actions, clearButton);
 
   const setStatus = (message, type = "") => {
@@ -333,7 +337,25 @@ function installGeneratePanel(node) {
   };
 
   const updateRevisionAvailability = () => {
-    reviseButton.disabled = running || !String(node.properties?.aipm_previous_result || "").trim();
+    const hasCache = Boolean(String(node.properties?.aipm_previous_result || "").trim());
+    reviseButton.disabled = running || !hasCache;
+    cacheButton.disabled = running || !hasCache;
+  };
+
+  const queueCurrentOutputs = async () => {
+    const previewNodeIds = new Set();
+    for (const output of node.outputs || []) {
+      for (const linkId of output?.links || []) {
+        const link = app.graph?.links?.[linkId];
+        const target = link ? app.graph?.getNodeById?.(link.target_id) : null;
+        const type = String(target?.type || target?.comfyClass || "").toLowerCase();
+        if (type.includes("showtext") || type.includes("displaytext") || type.includes("previewtext")) {
+          previewNodeIds.add(String(target.id));
+        }
+      }
+    }
+    const executionTargets = previewNodeIds.size ? [...previewNodeIds] : [String(node.id)];
+    await app.queuePrompt(0, 1, executionTargets);
   };
 
   const run = async (revise = false) => {
@@ -375,6 +397,7 @@ function installGeneratePanel(node) {
     }
     button.disabled = true;
     reviseButton.disabled = true;
+    cacheButton.disabled = true;
     clearButton.disabled = true;
     setStatus(revise ? "正在保留未修改内容并定向优化……" : "正在分析输入并生成专业提示词……");
     const previousMode = node.mode;
@@ -383,26 +406,12 @@ function installGeneratePanel(node) {
       node.widgets.splice(Math.min(previousResultIndex, node.widgets.length), 0, previousResult);
     }
     try {
-      // Queue direct text-preview consumers as the execution endpoints. This
-      // updates ShowText nodes without continuing into CLIP/sampling/image
-      // generation. Fall back to the AIPM node when no preview is connected.
-      const previewNodeIds = new Set();
-      for (const output of node.outputs || []) {
-        for (const linkId of output?.links || []) {
-          const link = app.graph?.links?.[linkId];
-          const target = link ? app.graph?.getNodeById?.(link.target_id) : null;
-          const type = String(target?.type || target?.comfyClass || "").toLowerCase();
-          if (type.includes("showtext") || type.includes("displaytext") || type.includes("previewtext")) {
-            previewNodeIds.add(String(target.id));
-          }
-        }
-      }
-      const executionTargets = previewNodeIds.size ? [...previewNodeIds] : [String(node.id)];
-      await app.queuePrompt(0, 1, executionTargets);
+      await queueCurrentOutputs();
     } catch (error) {
       running = false;
       button.disabled = false;
       reviseButton.disabled = false;
+      cacheButton.disabled = false;
       clearButton.disabled = false;
       button.textContent = isRefinement ? "分析并细化" : "生成 / 重新创作";
       reviseButton.textContent = isRefinement ? "根据新意见继续细化" : "按修改意见优化";
@@ -417,6 +426,47 @@ function installGeneratePanel(node) {
   };
   button.onclick = () => run(false);
   reviseButton.onclick = () => run(true);
+  cacheButton.onclick = async () => {
+    if (running) return;
+    const cached = String(node.properties?.aipm_previous_result || "").trim();
+    if (!cached) {
+      setStatus("还没有可输出的缓存，请先生成一次提示词。", "error");
+      updateRevisionAvailability();
+      return;
+    }
+    const modification = node.widgets?.find((widget) =>
+      widget.name === "修改意见" || widget.name === "遇到的问题与修改目标"
+    );
+    const originalModification = String(modification?.value || "");
+    running = true;
+    currentAction = "cache";
+    if (previousResult) previousResult.value = cached;
+    if (modification && !isRefinement) modification.value = "";
+    button.disabled = true;
+    reviseButton.disabled = true;
+    cacheButton.disabled = true;
+    clearButton.disabled = true;
+    setStatus("正在从本地缓存重新输出，不调用远程服务……");
+    const previousMode = node.mode;
+    node.mode = 0;
+    if (previousResult && !node.widgets?.includes(previousResult)) {
+      node.widgets.splice(Math.min(previousResultIndex, node.widgets.length), 0, previousResult);
+    }
+    try {
+      await queueCurrentOutputs();
+    } catch (error) {
+      running = false;
+      button.disabled = false;
+      reviseButton.disabled = false;
+      cacheButton.disabled = false;
+      clearButton.disabled = false;
+      updateRevisionAvailability();
+      setStatus(`缓存输出失败：${error?.message || error}`, "error");
+    } finally {
+      if (modification) modification.value = originalModification;
+      node.mode = previousMode;
+    }
+  };
   clearButton.onclick = () => {
     if (running) return;
     const modification = node.widgets?.find((widget) =>
@@ -444,10 +494,15 @@ function installGeneratePanel(node) {
     running = false;
     button.disabled = false;
     reviseButton.disabled = false;
+    cacheButton.disabled = false;
     clearButton.disabled = false;
     button.textContent = isRefinement ? "分析并细化" : "生成 / 重新创作";
     reviseButton.textContent = isRefinement ? "根据新意见继续细化" : "按修改意见优化";
-    setStatus(currentAction === "revise" ? "提示词优化完成，已保存为新的有效版本。" : "提示词生成完成，已保存为上次有效结果。", "ok");
+    setStatus(currentAction === "cache"
+      ? "缓存已重新输出，未调用远程服务。"
+      : currentAction === "revise"
+        ? "提示词优化完成，已保存为新的有效版本。"
+        : "提示词生成完成，已保存为上次有效结果。", "ok");
   };
   const executed = ({ detail }) => {
     if (String(detail?.node ?? detail?.display_node ?? "") !== String(node.id)) return;
@@ -459,6 +514,7 @@ function installGeneratePanel(node) {
     running = false;
     button.disabled = false;
     reviseButton.disabled = false;
+    cacheButton.disabled = false;
     clearButton.disabled = false;
     button.textContent = isRefinement ? "分析并细化" : "生成 / 重新创作";
     reviseButton.textContent = isRefinement ? "根据新意见继续细化" : "按修改意见优化";
