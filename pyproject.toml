@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-aipm"
-version = "1.0.0"
-description = "AI Prompt Master image and video prompt nodes for ComfyUI"
+version = "1.1.0"
+description = "AI Prompt Master image, video, and prompt-refinement nodes for ComfyUI"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
 authors = [{ name = "bo341805sg" }]

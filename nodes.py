@@ -135,6 +135,11 @@ VIDEO_PROMPT_SKILL_BY_PROFILE = {
     "HunyuanVideo 系列": "aipm-video-general",
     "中文自然语言视频模型（通用）": "aipm-video-general",
 }
+REFINEMENT_MODEL_PROFILES = [
+    "自动判断 / 通用（推荐）",
+    *[value for value in IMAGE_MODEL_PROFILES if value != "自动判断 / 通用（推荐）"],
+    *VIDEO_MODEL_PROFILES,
+]
 NATIVE_QUALITY_ANCHORS = {
     "Pony Diffusion / Pony 系模型": "score_9, score_8_up, score_7_up, score_6_up, score_5_up, score_4_up",
     "Illustrious / NoobAI 系模型": "masterpiece, best quality, highres",
@@ -145,6 +150,7 @@ SKILLS_DIR = Path(__file__).resolve().parent / "skills"
 
 def load_prompt_skill(model_profile: str) -> tuple[str, str]:
     skill_id = (
+        "aipm-prompt-refinement" if str(model_profile) == "__refinement__" else
         VIDEO_PROMPT_SKILL_BY_PROFILE.get(str(model_profile))
         or PROMPT_SKILL_BY_PROFILE.get(str(model_profile), "aipm-general-natural")
     )
@@ -424,6 +430,34 @@ class ReferenceAnalysisPipeline:
         return profiles, cache_hits
 
 
+class AIPMImagePrompt:
+    CATEGORY = CATEGORY
+    FUNCTION = "generate"
+    OUTPUT_NODE = True
+    RETURN_TYPES = ("AIPM_IMAGE_PROMPT", "STRING", "STRING", "STRING")
+    RETURN_NAMES = ("提示词数据", "正向提示词", "负向提示词", "完整结果 JSON")
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "画面描述与创作要求": ("STRING", {"default": "", "multiline": True, "dynamicPrompts": False}),
+                "远程服务地址": ("STRING", {"default": "http://192.168.10.27:8080/v1"}),
+                "模型名称": ("STRING", {"default": "Huihui-Qwen3.8-27B-abliterated-Q5_K.gguf"}),
+                "目标生图模型": (IMAGE_MODEL_PROFILES, {"default": "Krea 2 / Krea 2 Turbo 系列"}),
+                "画面比例": (["自动", "1:1", "16:9", "9:16", "4:3", "3:4", "21:9"],),
+                "提示词语言": (["自动适配（推荐）", "中文", "English"],),
+                "参考图用途": (["多参考改图", "仅分析参考"], {"default": "多参考改图"}),
+            },
+            "optional": {
+                "参考图片": ("IMAGE",),
+                "参考图片2": ("IMAGE",),
+                "参考图片3": ("IMAGE",),
+                "修改意见": ("STRING", {"default": "", "multiline": True, "dynamicPrompts": False}),
+            },
+        }
+
+
 class AIPMVideoPrompt:
     CATEGORY = CATEGORY
     FUNCTION = "generate"
@@ -458,7 +492,7 @@ class AIPMVideoPrompt:
         return {
             "required": {
                 "视频内容与导演要求": ("STRING", {"default": "", "multiline": True, "dynamicPrompts": False}),
-                "远程服务地址": ("STRING", {"default": "http://127.0.0.1:8080/v1"}),
+                "远程服务地址": ("STRING", {"default": "http://192.168.10.27:8080/v1"}),
                 "模型名称": ("STRING", {"default": "Huihui-Qwen3.8-27B-abliterated-Q5_K.gguf"}),
                 "目标视频模型": (VIDEO_MODEL_PROFILES,),
                 "生成模式": (["自动判断（推荐）", "文生视频", "多参考 Ref2VA", "首尾帧 FL2VA"],),
@@ -1043,6 +1077,125 @@ class AIPMVideoPrompt:
 AIPMVideoPromptCore = AIPMVideoPrompt
 
 
+def resolve_refinement_profile(prompt_type: str, target_model: str) -> str:
+    if str(target_model) in PROMPT_SKILL_BY_PROFILE or str(target_model) in VIDEO_PROMPT_SKILL_BY_PROFILE:
+        return str(target_model)
+    value = str(target_model or "").lower()
+    if str(prompt_type) == "生视频提示词" or any(key in value for key in ("h3", "video", "wan", "ltx", "hunyuanvideo")):
+        if "h3" in value or "minimax" in value: return "MiniMax H3（自动判断模式）"
+        if "wan" in value: return "Wan 系列"
+        if "ltx" in value: return "LTX-Video 系列"
+        if "hunyuan" in value: return "HunyuanVideo 系列"
+        return "中文自然语言视频模型（通用）"
+    routes = (
+        (("krea",), "Krea 2 / Krea 2 Turbo 系列"), (("flux",), "FLUX.1 / FLUX.2 系列"),
+        (("pony",), "Pony Diffusion / Pony 系模型"), (("illustrious", "noobai"), "Illustrious / NoobAI 系模型"),
+        (("sdxl", "stable diffusion xl"), "Stable Diffusion XL 基础模型"),
+        (("sd3", "stable diffusion 3"), "Stable Diffusion 3 / 3.5"),
+        (("sd1", "stable diffusion 1"), "Stable Diffusion 1.x"),
+        (("qwen image", "qwen-image"), "Qwen Image 系列"), (("z-image", "zimage"), "Z-Image 系列"),
+        (("hunyuanimage", "hunyuan image"), "HunyuanImage 系列"), (("kolors",), "Kolors 系列"),
+    )
+    for keys, profile in routes:
+        if any(key in value for key in keys): return profile
+    return "自动判断 / 通用（推荐）"
+
+
+class AIPMPromptRefinement:
+    CATEGORY = CATEGORY
+    FUNCTION = "refine"
+    OUTPUT_NODE = True
+    RETURN_TYPES = ("STRING", "STRING", "STRING", "STRING", "STRING")
+    RETURN_NAMES = ("细化后提示词", "细化后负向提示词", "问题诊断", "修改摘要", "完整结果 JSON")
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "原始提示词": ("STRING", {"default": "", "multiline": True, "dynamicPrompts": False}),
+            "遇到的问题与修改目标": ("STRING", {"default": "", "multiline": True, "dynamicPrompts": False}),
+            "提示词类型": (["自动判断", "生图提示词", "生视频提示词"], {"default": "自动判断"}),
+            "目标模型": (REFINEMENT_MODEL_PROFILES, {"default": "自动判断 / 通用（推荐）"}),
+            "必须保留的内容": ("STRING", {"default": "", "multiline": True, "dynamicPrompts": False}),
+            "远程服务地址": ("STRING", {"default": "http://192.168.10.27:8080/v1"}),
+            "模型名称": ("STRING", {"default": "Huihui-Qwen3.8-27B-abliterated-Q5_K.gguf"}),
+            "输出语言": (["跟随原提示词（推荐）", "中文", "English"],),
+        }, "optional": {
+            "上次结果JSON": ("STRING", {"default": "", "multiline": True, "dynamicPrompts": False}),
+        }}
+
+    @staticmethod
+    def response_format() -> dict[str, Any]:
+        fields = {
+            "refined_prompt": {"type": "string"}, "negative_prompt": {"type": "string"},
+            "diagnosis": {"type": "array", "items": {"type": "string"}},
+            "modification_summary": {"type": "array", "items": {"type": "string"}},
+            "preserved_elements": {"type": "array", "items": {"type": "string"}},
+            "workflow_recommendations": {"type": "array", "items": {"type": "string"}},
+        }
+        return {"type": "json_schema", "json_schema": {"name": "prompt_refinement_result", "strict": True,
+            "schema": {"type": "object", "properties": fields, "required": list(fields)}}}
+
+    @staticmethod
+    def _cached_result(raw: str):
+        try: value = json.loads(str(raw or ""))
+        except json.JSONDecodeError as exc: raise PromptAssistantError("已保存的细化结果无效，请清空后重新执行") from exc
+        if not isinstance(value, dict) or value.get("schema") != "aipm_prompt_refinement" or not value.get("refined_prompt"):
+            raise PromptAssistantError("已保存的细化结果无效，请清空后重新执行")
+        text = json.dumps(value, ensure_ascii=False, indent=2)
+        return {"ui": {"text": [value["refined_prompt"], value.get("negative_prompt", ""), text]}, "result": (
+            value["refined_prompt"], value.get("negative_prompt", ""), value.get("diagnosis_text", ""),
+            value.get("modification_summary_text", ""), text)}
+
+    def refine(self, 原始提示词, 遇到的问题与修改目标, 提示词类型, 目标模型, 必须保留的内容,
+               远程服务地址, 模型名称, 输出语言, 上次结果JSON=""):
+        original, issue, cached = map(lambda value: str(value or "").strip(), (原始提示词, 遇到的问题与修改目标, 上次结果JSON))
+        marker, revision_marker = "__AIPM_RUN_V1__", "__AIPM_REVISION_V1__"
+        independent, previous = issue.startswith(marker) or issue.startswith(revision_marker), None
+        if issue.startswith(marker): issue = issue[len(marker):].strip()
+        elif issue.startswith(revision_marker):
+            try:
+                payload = json.loads(issue[len(revision_marker):]); issue = str(payload.get("instruction") or "").strip()
+                cached = str(payload.get("previous_result") or cached).strip(); previous = json.loads(cached) if cached else None
+            except (json.JSONDecodeError, AttributeError) as exc: raise PromptAssistantError("继续细化请求无效，请重新执行") from exc
+        if not original: raise PromptAssistantError("请先填写原始提示词")
+        if not issue: raise PromptAssistantError("请填写遇到的问题与修改目标")
+        if not independent:
+            if cached: return self._cached_result(cached)
+            raise PromptAssistantError("AIPM不会随主工作流调用远程AI。请点击节点上的“分析并细化”按钮。")
+        profile = resolve_refinement_profile(提示词类型, 目标模型)
+        base_skill_id, base_skill = load_prompt_skill(profile)
+        refinement_skill_id, refinement_skill = load_prompt_skill("__refinement__")
+        language_rule = {"中文": "可执行提示词与诊断使用简体中文，固定标签保持原样。", "English": "Write executable prompts in English."}.get(str(输出语言), "保持原提示词的主要语言和固定语法。")
+        context = {"task": "诊断并最小幅度细化已有提示词", "original_prompt": original,
+            "observed_problem_and_goal": issue, "prompt_type": 提示词类型, "target_model": 目标模型,
+            "resolved_profile": profile, "must_preserve": str(必须保留的内容 or "").strip(),
+            "previous_refinement": previous, "language_rule": language_rule,
+            "base_prompt_skill_id": base_skill_id, "base_prompt_skill": base_skill,
+            "refinement_skill_id": refinement_skill_id, "refinement_skill": refinement_skill}
+        payload = {"model": str(模型名称 or "").strip(), "messages": [
+            {"role": "system", "content": "你是AI生成提示词诊断与细化专家。只做解决已报告问题所需的最小修改，保留无关内容。无法靠提示词解决的问题必须写入诊断和工作流建议。只输出schema JSON。"},
+            {"role": "user", "content": json.dumps(context, ensure_ascii=False)}],
+            "temperature": 0.2, "max_tokens": 1800, "cache_prompt": False,
+            "response_format": self.response_format(), "chat_template_kwargs": {"enable_thinking": False}}
+        def validate(value):
+            if not str(value.get("refined_prompt") or "").strip(): raise PromptAssistantError("refined_prompt 不能为空")
+        generated, response = OpenAICompatibleClient.request_object(远程服务地址, payload, "提示词诊断与细化", validator=validate)
+        diagnosis = [str(x).strip() for x in generated.get("diagnosis", []) if str(x).strip()]
+        summary = [str(x).strip() for x in generated.get("modification_summary", []) if str(x).strip()]
+        package = {"schema": "aipm_prompt_refinement", "version": "1.0", "prompt_type": 提示词类型,
+            "target_model": 目标模型, "resolved_profile": profile, "base_prompt_skill_id": base_skill_id,
+            "refinement_skill_id": refinement_skill_id, "original_prompt": original, "problem_and_goal": issue,
+            "refined_prompt": str(generated.get("refined_prompt") or "").strip(),
+            "negative_prompt": str(generated.get("negative_prompt") or "").strip(),
+            "diagnosis": diagnosis, "diagnosis_text": "\n".join(diagnosis), "modification_summary": summary,
+            "modification_summary_text": "\n".join(summary), "preserved_elements": generated.get("preserved_elements", []),
+            "workflow_recommendations": generated.get("workflow_recommendations", []),
+            "usage": response.get("usage") if isinstance(response.get("usage"), dict) else {}}
+        raw = json.dumps(package, ensure_ascii=False, indent=2)
+        return {"ui": {"text": [package["refined_prompt"], package["negative_prompt"], raw]}, "result": (
+            package["refined_prompt"], package["negative_prompt"], package["diagnosis_text"], package["modification_summary_text"], raw)}
+
+
 class AIPMImagePrompt:
     CATEGORY = CATEGORY
     FUNCTION = "generate"
@@ -1055,7 +1208,7 @@ class AIPMImagePrompt:
         return {
             "required": {
                 "画面描述与创作要求": ("STRING", {"default": "", "multiline": True, "dynamicPrompts": False}),
-                "远程服务地址": ("STRING", {"default": "http://127.0.0.1:8080/v1"}),
+                "远程服务地址": ("STRING", {"default": "http://192.168.10.27:8080/v1"}),
                 "模型名称": ("STRING", {"default": "Huihui-Qwen3.8-27B-abliterated-Q5_K.gguf"}),
                 "目标生图模型": (IMAGE_MODEL_PROFILES, {"default": "Krea 2 / Krea 2 Turbo 系列"}),
                 "画面比例": (["自动", "1:1", "16:9", "9:16", "4:3", "3:4", "21:9"],),
@@ -1550,8 +1703,10 @@ class AIPMCineTimelineAdapter:
 NODE_CLASS_MAPPINGS = {
     "AIPMImagePrompt": AIPMImagePrompt,
     "AIPMVideoPrompt": AIPMVideoPromptCore,
+    "AIPMPromptRefinement": AIPMPromptRefinement,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "AIPMImagePrompt": "AI 提示词大师 · 生图",
     "AIPMVideoPrompt": "AI 提示词大师 · 生视频",
+    "AIPMPromptRefinement": "AI 提示词大师 · 提示词细化",
 }

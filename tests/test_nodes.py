@@ -13,11 +13,11 @@ class PromptAssistantTests(unittest.TestCase):
     def test_only_image_and_video_nodes_are_registered(self):
         self.assertEqual(
             set(nodes.NODE_CLASS_MAPPINGS),
-            {"AIPMImagePrompt", "AIPMVideoPrompt"},
+            {"AIPMImagePrompt", "AIPMVideoPrompt", "AIPMPromptRefinement"},
         )
         self.assertEqual(
             set(nodes.NODE_DISPLAY_NAME_MAPPINGS),
-            {"AIPMImagePrompt", "AIPMVideoPrompt"},
+            {"AIPMImagePrompt", "AIPMVideoPrompt", "AIPMPromptRefinement"},
         )
 
     def test_image_node_defaults_to_krea_2(self):
@@ -631,6 +631,32 @@ class PromptAssistantTests(unittest.TestCase):
         ui = (ROOT / "web" / "aipm_ui.js").read_text(encoding="utf-8")
         self.assertIn("function migrateShiftedCachedResult(node)", ui)
         self.assertIn('modification.value = ""', ui)
+
+    def test_refinement_node_contract_and_skill(self):
+        inputs = nodes.AIPMPromptRefinement.INPUT_TYPES()
+        self.assertIn("原始提示词", inputs["required"])
+        self.assertIn("遇到的问题与修改目标", inputs["required"])
+        target = inputs["required"]["目标模型"]
+        self.assertIsInstance(target[0], list)
+        self.assertIn("Krea 2 / Krea 2 Turbo 系列", target[0])
+        self.assertIn("MiniMax H3（自动判断模式）", target[0])
+        self.assertEqual(target[1]["default"], "自动判断 / 通用（推荐）")
+        self.assertEqual(nodes.AIPMPromptRefinement.RETURN_NAMES[-1], "完整结果 JSON")
+        skill_id, skill = nodes.load_prompt_skill("__refinement__")
+        self.assertEqual(skill_id, "aipm-prompt-refinement")
+        self.assertIn("smallest sufficient repair", skill)
+
+    def test_refinement_main_workflow_reuses_cache(self):
+        stored = {"schema": "aipm_prompt_refinement", "refined_prompt": "修复后的提示词",
+                  "negative_prompt": "穿模", "diagnosis_text": "接触关系不清", "modification_summary_text": "补充遮挡"}
+        result = nodes.AIPMPromptRefinement().refine(
+            "原提示词", "人物手穿过杯子", "生图提示词", "Krea2", "保留人物",
+            "http://host/v1", "model.gguf", "中文", json.dumps(stored, ensure_ascii=False))
+        self.assertEqual(result["result"][0], "修复后的提示词")
+
+    def test_refinement_profile_resolution(self):
+        self.assertEqual(nodes.resolve_refinement_profile("生图提示词", "Krea2"), "Krea 2 / Krea 2 Turbo 系列")
+        self.assertEqual(nodes.resolve_refinement_profile("生视频提示词", "MiniMax H3"), "MiniMax H3（自动判断模式）")
 
 
 if __name__ == "__main__":

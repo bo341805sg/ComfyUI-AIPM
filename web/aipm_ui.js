@@ -1,7 +1,7 @@
 import { app } from "../../../scripts/app.js";
 import { api } from "../../../scripts/api.js";
 
-const VERSION = 36;
+const VERSION = 37;
 const AIPM_MIN_WIDTH = 480;
 const REVISION_MARKER = "__AIPM_REVISION_V1__";
 const RUN_MARKER = "__AIPM_RUN_V1__";
@@ -118,7 +118,9 @@ function configureStableNodeLayout(node) {
   node.properties ||= {};
   delete node.properties.aipm_locked_width;
 
-  const modification = node.widgets?.find((widget) => widget.name === "修改意见");
+  const modification = node.widgets?.find((widget) =>
+    widget.name === "修改意见" || widget.name === "遇到的问题与修改目标"
+  );
   if (modification) {
     modification.computeSize = (width) => [width, 54];
     modification.options ||= {};
@@ -131,6 +133,13 @@ function configureStableNodeLayout(node) {
       element.style.maxHeight = "44px";
       element.style.resize = "none";
     }
+  }
+
+  if (String(node?.comfyClass || node?.type || "") === "AIPMPromptRefinement") {
+    const originalPrompt = node.widgets?.find((widget) => widget.name === "原始提示词");
+    const mustPreserve = node.widgets?.find((widget) => widget.name === "必须保留的内容");
+    if (originalPrompt) originalPrompt.computeSize = (width) => [width, 150];
+    if (mustPreserve) mustPreserve.computeSize = (width) => [width, 54];
   }
 
   const originalResize = node.onResize;
@@ -275,6 +284,7 @@ function installGeneratePanel(node) {
   removeOldPanel(node);
   let running = false;
   let currentAction = "generate";
+  const isRefinement = String(node?.comfyClass || node?.type || "") === "AIPMPromptRefinement";
   const previousResult = node.widgets?.find((item) => item.name === "上次结果JSON");
   const referenceManifest = node.widgets?.find((item) => item.name === "参考素材清单JSON");
   const previousResultIndex = Math.max(node.widgets?.indexOf(previousResult) ?? -1, 0);
@@ -299,15 +309,15 @@ function installGeneratePanel(node) {
   </style>`;
   const button = document.createElement("button");
   button.type = "button";
-  button.textContent = "生成 / 重新创作";
+  button.textContent = isRefinement ? "分析并细化" : "生成 / 重新创作";
   const reviseButton = document.createElement("button");
   reviseButton.type = "button";
   reviseButton.className = "secondary";
-  reviseButton.textContent = "按修改意见优化";
+  reviseButton.textContent = isRefinement ? "根据新意见继续细化" : "按修改意见优化";
   const clearButton = document.createElement("button");
   clearButton.type = "button";
   clearButton.className = "clear";
-  clearButton.textContent = "清空上次结果";
+  clearButton.textContent = "清空结果";
   const status = document.createElement("div");
   status.className = "status";
   status.textContent = "仅执行当前节点，不触发工作流其他生成节点。";
@@ -329,13 +339,15 @@ function installGeneratePanel(node) {
   const run = async (revise = false) => {
     if (running) return;
     const idea = node.widgets?.find((widget) =>
-      widget.name === "画面描述与创作要求" || widget.name === "视频内容与导演要求"
+      widget.name === "画面描述与创作要求" || widget.name === "视频内容与导演要求" || widget.name === "原始提示词"
     );
     if (!String(idea?.value || "").trim()) {
       setStatus("请先填写创作内容与导演要求。", "error");
       return;
     }
-    const modification = node.widgets?.find((widget) => widget.name === "修改意见");
+    const modification = node.widgets?.find((widget) =>
+      widget.name === "修改意见" || widget.name === "遇到的问题与修改目标"
+    );
     const originalModification = String(modification?.value || "");
     if (revise && !String(modification?.value || "").trim()) {
       setStatus("请先填写修改意见。", "error");
@@ -353,7 +365,9 @@ function installGeneratePanel(node) {
         previous_result: String(node.properties?.aipm_previous_result || ""),
       });
     } else {
-      if (modification) modification.value = `${RUN_MARKER}${Date.now()}`;
+      if (modification) modification.value = isRefinement
+        ? `${RUN_MARKER}${originalModification}`
+        : `${RUN_MARKER}${Date.now()}`;
       if (previousResult) previousResult.value = "";
     }
     if (referenceManifest) {
@@ -390,8 +404,8 @@ function installGeneratePanel(node) {
       button.disabled = false;
       reviseButton.disabled = false;
       clearButton.disabled = false;
-      button.textContent = "生成 / 重新创作";
-      reviseButton.textContent = "按修改意见优化";
+      button.textContent = isRefinement ? "分析并细化" : "生成 / 重新创作";
+      reviseButton.textContent = isRefinement ? "根据新意见继续细化" : "按修改意见优化";
       updateRevisionAvailability();
       setStatus(`提交失败：${error?.message || error}`, "error");
     } finally {
@@ -405,7 +419,9 @@ function installGeneratePanel(node) {
   reviseButton.onclick = () => run(true);
   clearButton.onclick = () => {
     if (running) return;
-    const modification = node.widgets?.find((widget) => widget.name === "修改意见");
+    const modification = node.widgets?.find((widget) =>
+      widget.name === "修改意见" || widget.name === "遇到的问题与修改目标"
+    );
     node.properties ||= {};
     node.properties.aipm_previous_result = "";
     if (previousResult) previousResult.value = "";
@@ -429,8 +445,8 @@ function installGeneratePanel(node) {
     button.disabled = false;
     reviseButton.disabled = false;
     clearButton.disabled = false;
-    button.textContent = "生成 / 重新创作";
-    reviseButton.textContent = "按修改意见优化";
+    button.textContent = isRefinement ? "分析并细化" : "生成 / 重新创作";
+    reviseButton.textContent = isRefinement ? "根据新意见继续细化" : "按修改意见优化";
     setStatus(currentAction === "revise" ? "提示词优化完成，已保存为新的有效版本。" : "提示词生成完成，已保存为上次有效结果。", "ok");
   };
   const executed = ({ detail }) => {
@@ -444,8 +460,8 @@ function installGeneratePanel(node) {
     button.disabled = false;
     reviseButton.disabled = false;
     clearButton.disabled = false;
-    button.textContent = "生成 / 重新创作";
-    reviseButton.textContent = "按修改意见优化";
+    button.textContent = isRefinement ? "分析并细化" : "生成 / 重新创作";
+    reviseButton.textContent = isRefinement ? "根据新意见继续细化" : "按修改意见优化";
     updateRevisionAvailability();
     setStatus(`生成失败：${detail?.exception_message || detail?.message || "请查看执行错误"}`, "error");
   };
@@ -504,7 +520,7 @@ function installGeneratePanel(node) {
 app.registerExtension({
   name: "AIPM.GenerateButton",
   async beforeRegisterNodeDef(nodeType, nodeData) {
-    if (!["AIPMImagePrompt", "AIPMVideoPrompt"].includes(nodeData.name)) return;
+    if (!["AIPMImagePrompt", "AIPMVideoPrompt", "AIPMPromptRefinement"].includes(nodeData.name)) return;
     const originalConfigure = nodeType.prototype.onConfigure;
     nodeType.prototype.onConfigure = function () {
       this._aipmLoadedFromWorkflow = true;
