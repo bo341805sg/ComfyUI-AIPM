@@ -5,6 +5,8 @@ description: Generate MiniMax H3 machine prompts in the official Context-IR dial
 
 # MiniMax H3 Context-IR Director
 
+Upstream specification: MiniMax-AI/MiniMax-H3 official `h3-prompt-writing` skill and its Base/Ref2VA guides, reviewed 2026-08-22. The runtime appends only the official mode reference selected for the current request; do not blend another mode's format into the result.
+
 Turn a creative request into one executable audiovisual timeline for MiniMax H3. `video_prompt` is a machine-facing H3 prompt. Keep the official structural field names, control tokens, task types, and retention markers in English, but write all descriptive prose in the language requested by the node. When Chinese is requested, the shot descriptions, reference explanations, performance, camera, lighting, soundscape, and music descriptions must be Chinese. Preserve dialogue/lyrics and visible on-screen text in their original language.
 
 ## Official format routing
@@ -47,7 +49,7 @@ non_diegetic_music:
 - `<Subject N>` is reusable visible content. `<Picture N>` is standalone only for a concrete keyframe/composition anchor. `<Video N>` denotes a whole-video edit, continuation, or temporal/camera structure. `<Audio N>` denotes copied or referenced audio; video sound is not automatically an audio reference.
 - Keep labels stable. `summary` begins with the accurate combination of `keyframe completion`, `reference generation`, `video editing`, `video continuation`, `audio reuse`, and/or `audio reference`.
 - `retention_analysis` uses only `fully_preserved`, `partially_preserved`, `attribute_transfer`, `weak_reference`; audio uses `fully_copy`, `partially_copy`, `reference`, `weak_reference`.
-- Reference-generation `detailed_description` should carry detail comparable to the official 350–500-English-word guidance, scaled by duration and information load rather than padded to a literal Chinese word count.
+- Scale `detailed_description` to duration and information load. Prefer complete, executable causality over an arbitrary word count; do not pad.
 
 ## Hard directing contract
 

@@ -148,7 +148,7 @@ NATIVE_QUALITY_ANCHORS = {
 SKILLS_DIR = Path(__file__).resolve().parent / "skills"
 
 
-def load_prompt_skill(model_profile: str) -> tuple[str, str]:
+def load_prompt_skill(model_profile: str, mode: str | None = None) -> tuple[str, str]:
     skill_id = (
         "aipm-prompt-refinement" if str(model_profile) == "__refinement__" else
         VIDEO_PROMPT_SKILL_BY_PROFILE.get(str(model_profile))
@@ -162,6 +162,15 @@ def load_prompt_skill(model_profile: str) -> tuple[str, str]:
     text = re.sub(r"^---\s*.*?\s*---\s*", "", text, count=1, flags=re.DOTALL)
     if not text:
         raise PromptAssistantError(f"目标提示词技能为空：{skill_id}")
+    if skill_id == "aipm-minimax-h3-video" and mode:
+        reference_name = "official-ref2va.md" if mode == "h3_ref2va" else "official-base.md"
+        reference_path = skill_path.parent / "references" / reference_name
+        if not reference_path.is_file():
+            raise PromptAssistantError(f"MiniMax H3 模式规则不存在：{reference_path}")
+        reference_text = reference_path.read_text(encoding="utf-8").strip()
+        if not reference_text:
+            raise PromptAssistantError(f"MiniMax H3 模式规则为空：{reference_name}")
+        text = f"{text}\n\n{reference_text}"
     return skill_id, text
 
 
@@ -599,6 +608,35 @@ class AIPMVideoPrompt:
             raise PromptAssistantError("中文模式下描述正文必须使用中文，只有H3官方语法保留英文")
 
     @staticmethod
+    def validate_h3_structure(prompt: str, mode: str, duration_seconds: int) -> None:
+        """Reject structurally invalid H3 prompts before they enter CineTimeline."""
+        text = str(prompt or "").strip()
+        base_fields = [
+            "integrated_multimodal_description", "overall_soundscape", "non_diegetic_music",
+        ]
+        ref_fields = [
+            "subject_definitions", "summary", "retention_analysis", "detailed_description",
+            "overall_soundscape", "non_diegetic_music",
+        ]
+        expected = ref_fields if mode == "h3_ref2va" else base_fields
+        found = re.findall(
+            r"(?m)^(subject_definitions|summary|retention_analysis|detailed_description|"
+            r"integrated_multimodal_description|overall_soundscape|non_diegetic_music)\s*:", text,
+        )
+        if found != expected:
+            raise PromptAssistantError(
+                f"MiniMax H3 {mode} 字段结构错误：应为 {' -> '.join(expected)}，实际为 {' -> '.join(found) or '无'}"
+            )
+        if "【" in text or "】" in text:
+            raise PromptAssistantError("MiniMax H3 机器提示词不能包含中文方括号编辑标签")
+        for minutes, seconds, millis in re.findall(r"At\s+(\d{2}):(\d{2})\.(\d{3})", text):
+            timestamp = int(minutes) * 60 + int(seconds) + int(millis) / 1000
+            if timestamp <= 0 or timestamp >= duration_seconds:
+                raise PromptAssistantError(
+                    f"镜头时间 {minutes}:{seconds}.{millis} 必须严格位于 0 与 {duration_seconds} 秒之间"
+                )
+
+    @staticmethod
     def bind_dialogue_speaker_ids(prompt: str, dialogue_lines: list[str]) -> str:
         """Deterministically bind planned speakers to H3 dialogue tags."""
         roles = [
@@ -798,6 +836,7 @@ class AIPMVideoPrompt:
 
             def validate_segment_text(text: str) -> None:
                 self.validate_prompt_text(text, requested_language)
+                self.validate_h3_structure(text, mode, duration_seconds)
                 if planned_dialogue and not re.search(
                     r"<d>\s*\[[^\]]+\]\s*.+?</d>", text, re.DOTALL,
                 ):
@@ -985,7 +1024,7 @@ class AIPMVideoPrompt:
             raise PromptAssistantError("MiniMax H3 FL2VA 最多接收两张图片：首帧与尾帧")
         if mode == "h3_ref2va" and audio1 is not None and not reference_profiles and video1 is None:
             raise PromptAssistantError("MiniMax H3 Ref2VA 不能只输入声音，至少还需要图片或视频参考")
-        skill_id, skill = load_prompt_skill(profile)
+        skill_id, skill = load_prompt_skill(profile, mode)
         return self.generate_timeline_package(
             service_url=str(远程服务地址), service_model=str(模型名称 or "").strip(),
             profile=profile, mode=mode, idea=idea, duration_seconds=duration_seconds,
