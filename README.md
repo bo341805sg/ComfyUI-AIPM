@@ -1,96 +1,39 @@
 # ComfyUI-AIPM
 
-`AIPM` 是“AI 提示词大师”（AI Prompt Master）的缩写。插件正式版注册三个可独立
-执行的 ComfyUI 节点：
+`AIPM` 是“AI 提示词大师”（AI Prompt Master）的缩写。插件注册三个可独立执行的 ComfyUI 节点：
 
 - `AI 提示词大师 · 生图`
 - `AI 提示词大师 · 生视频`
 - `AI 提示词大师 · 提示词细化`
 
-它们调用 OpenAI 兼容的多模态服务生成专业提示词。用户点击节点内按钮时只执行当前
-AIPM 节点；主生成工作流执行时复用最近一次结果，不会再次调用远程服务。
+节点按钮会调用 OpenAI 兼容的多模态服务；主工作流运行时只复用已缓存结果，不会再次提交远程生成。
 
-三个节点均提供并列的“生成 / 优化 / 输出缓存”操作。“输出缓存”只重新输出节点内
-保存的上次有效结果，不访问远程服务；生视频节点还会把缓存的完整 JSON 再次写入已连接
-的 CineTimeline，适合修改后续工作流后重新注入提示词数据。
+## 主要能力
 
-## 生图节点
-
-- 支持 Krea 2、FLUX、SDXL、SD 1.x、SD3、Illustrious、Pony 等提示词体系。
-- 根据目标模型自动选择中文自然语言、英文自然语言或标签/权重格式。
-- 支持最多三张参考图逐图分析。
-- `仅分析参考` 输出纯提示词；`多参考改图` 保留 `image1/image2/image3` 绑定关系。
-- 支持基于上次结果和修改意见继续优化。
-
-## 生视频节点
-
-- 支持 MiniMax H3 以及通用自然语言视频提示词。
-- 支持文生视频、多参考 Ref2VA、首尾帧 FL2VA 自动判断。
-- 支持图片、视频和音频参考。
-- 支持全局提示词、多个分段提示词、全局/分段参考的本地 JSON 组装。
-- 支持 H3 台词、说话人音色绑定、场景声、摄影、表演和连续性规则。
-- 输出的第一个结果就是标准 CineTimeline 文档，可直接连接
-  `CineTimeline Plan.timeline_json`。
-
-## 提示词细化节点
-
-- 输入已有的生图或生视频提示词，以及实际生成中遇到的问题。
-- 从现有生图、视频提示词规则族下拉菜单选择目标模型。
-- 先区分提示词问题与模型、采样、去噪、分辨率或工作流问题，再做最小必要修改。
-- 可锁定人物、场景、动作、镜头、台词等必须保留的内容。
-- 输出细化后的正向/负向提示词、问题诊断、修改摘要和完整 JSON。
-- 支持在上次有效结果上继续细化；主工作流执行时仅复用缓存。
-
-内部的 CineTimeline 转换器只用于本地组装标准 JSON，不作为第三个 ComfyUI 节点注册。
+- Krea 2 文生图、风格参考、身份编辑。
+- FLUX.1 文生图、FLUX.2 文生图与多参考编辑。
+- Qwen Image 文生图、单图编辑与多图编辑。
+- SD/SDXL、SD3、Pony、Illustrious/NoobAI 等模型方言。
+- 最多三张生图参考图的逐图分析、`image1/image2/image3` 有序绑定和完整职责校验。
+- MiniMax H3 T2VA、I2VA、L2VA、FL2VA、Ref2VA，以及 Wan、LTX-Video、HunyuanVideo 专用技能。
+- 多分段视频提示词、台词/说话人、声音、摄影、表演、连续性与 CineTimeline JSON 输出。
+- 基于上次结果的最小必要提示词修复。
 
 ## 远程服务
 
-服务必须兼容：
-
-```text
-POST /v1/chat/completions
-```
-
-节点内可动态修改服务地址与模型名称。需要鉴权时，通过环境变量设置：
-
-```text
-AIPM_API_KEY
-```
-
-密钥不会写入工作流或插件文件。
-
-默认模型名称为：
-
-```text
-Huihui-Qwen3.8-27B-abliterated-Q5_K.gguf
-```
+服务需兼容 `POST /v1/chat/completions`。需要鉴权时设置环境变量 `AIPM_API_KEY`；密钥不会写入工作流。
 
 ## 安装
 
-将插件目录放入：
-
-```text
-ComfyUI/custom_nodes/ComfyUI-AIPM
-```
-
-重启 ComfyUI 后，在节点菜单中搜索“AI 提示词大师”。
-
-## 已验收范围
-
-- 生图与生视频节点独立执行。
-- 主工作流缓存复用，不重复请求远程模型。
-- 中文/英文及各提示词体系的输出约束。
-- 多图逐张分析和多参考绑定。
-- MiniMax H3 多分段、台词、说话人、场景音效与参考关系。
-- AIPM 标准 JSON 直接写入 CineTimeline。
-- 提示词细化的最小修改、目标模型规则和工作流建议输出。
-- 46 项单元测试通过。
+将目录放入 `ComfyUI/custom_nodes/ComfyUI-AIPM`，安装依赖后重启 ComfyUI。
 
 ## 测试
 
 ```bash
-python -m pytest -q
+python -m unittest discover -s tests -v
 ```
+
+当前回归测试：51 项。
 
 ## License
 

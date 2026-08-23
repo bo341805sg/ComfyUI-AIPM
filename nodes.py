@@ -27,9 +27,15 @@ IMAGE_MODEL_PROFILES = [
     "Stable Diffusion XL 基础模型",
     "Pony Diffusion / Pony 系模型",
     "Illustrious / NoobAI 系模型",
-    "FLUX.1 / FLUX.2 系列",
-    "Krea 2 / Krea 2 Turbo 系列",
-    "Qwen Image 系列",
+    "FLUX.1 文生图",
+    "FLUX.2 文生图",
+    "FLUX.2 多参考编辑",
+    "Krea 2 / Krea 2 Turbo 文生图",
+    "Krea 2 风格参考",
+    "Krea 2 身份编辑",
+    "Qwen Image 文生图",
+    "Qwen Image 单图编辑",
+    "Qwen Image 多图编辑",
     "Z-Image 系列",
     "Stable Diffusion 3 / 3.5",
     "HiDream Image 系列",
@@ -49,8 +55,17 @@ IMAGE_PROMPT_DIALECTS = {
     "Pony Diffusion / Pony 系模型": "使用 Pony 的 score_9、score_8_up 等质量标签及 booru 风格标签，人物数量、评级与构图标签前置。",
     "Illustrious / NoobAI 系模型": "使用 Danbooru/booru 标签语法，角色、作品、人数、构图、服装与动作标签清晰分组，不套用 Pony score 标签。",
     "FLUX.1 / FLUX.2 系列": "使用详细自然语言描述，强调空间关系、镜头、光线、材质和文字内容；不堆砌 SD 质量标签，通常不依赖负面提示词。",
+    "FLUX.1 文生图": "使用英文自然语言描述主体、空间关系、镜头、光线、材质和准确文字；不使用 SD 权重语法。",
+    "FLUX.2 文生图": "使用英文自然语言和明确视觉层级；区分用户原始意图与可选提示扩写，不虚构关键对象。",
+    "FLUX.2 多参考编辑": "逐张说明参考图职责、目标位置和不可改变项；明确编辑动作，防止身份、服装、风格和背景跨图污染。",
     "Krea 2 / Krea 2 Turbo 系列": "使用清晰的摄影导演式自然语言，优先描述主体、场景关系、镜头与构图、真实光线、色彩和材质；避免 SD 式质量词堆叠，Turbo 版本保持提示精炼。",
+    "Krea 2 / Krea 2 Turbo 文生图": "使用忠实、连贯的英文自然语言；Turbo 删除重复描述但不删主体、动作和空间约束。",
+    "Krea 2 风格参考": "文字固定内容和构图，参考图仅承担色板、媒介、纹理与审美；明确禁止继承参考图主体。",
+    "Krea 2 身份编辑": "身份参考优先；明确保留脸部辨识特征和未修改内容，并把风格压力限制在身份之外。",
     "Qwen Image 系列": "优先使用清晰中文自然语言，精确描述主体关系、构图和需要渲染的文字；参考图使用 <Picture N>。",
+    "Qwen Image 文生图": "使用清晰中文自然语言，精确描述主体关系、构图与可见文字，不混入编辑指令。",
+    "Qwen Image 单图编辑": "使用直接、具体的局部编辑指令，明确修改项与保留项，避免重新描述整张图导致漂移。",
+    "Qwen Image 多图编辑": "逐图指定元素来源、目标位置和保留项；不合并不同人物身份，不把参考图背景带入成图。",
     "Z-Image 系列": "使用简洁但完整的中文或英文自然语言，主体动作与画面结构前置，避免冗余质量词和过长否定列表。",
     "Stable Diffusion 3 / 3.5": "使用自然语言与关键词混合提示，明确对象关系、构图、光线和文字；避免 SD1.x 式碎片化标签堆叠。",
     "HiDream Image 系列": "使用完整自然语言，明确多主体关系、空间层次、风格和光照；不要附加服务商参数。",
@@ -68,6 +83,9 @@ IMAGE_PROMPT_DIALECTS = {
 IMAGE_PROMPT_LANGUAGES = {
     "中文自然语言（闭源模型通用）": "zh-CN",
     "Qwen Image 系列": "zh-CN",
+    "Qwen Image 文生图": "zh-CN",
+    "Qwen Image 单图编辑": "zh-CN",
+    "Qwen Image 多图编辑": "zh-CN",
     "Z-Image 系列": "zh-CN",
     "HunyuanImage 系列": "zh-CN",
     "Kolors 系列": "zh-CN",
@@ -76,7 +94,13 @@ IMAGE_PROMPT_LANGUAGES = {
     "Pony Diffusion / Pony 系模型": "en-tags",
     "Illustrious / NoobAI 系模型": "en-tags",
     "FLUX.1 / FLUX.2 系列": "en",
+    "FLUX.1 文生图": "en",
+    "FLUX.2 文生图": "en",
+    "FLUX.2 多参考编辑": "en",
     "Krea 2 / Krea 2 Turbo 系列": "en",
+    "Krea 2 / Krea 2 Turbo 文生图": "en",
+    "Krea 2 风格参考": "en",
+    "Krea 2 身份编辑": "en",
     "Stable Diffusion 3 / 3.5": "en",
     "HiDream Image 系列": "en",
     "Anima 系列": "en-tags",
@@ -94,12 +118,21 @@ PROMPT_SKILL_BY_PROFILE = {
     "Illustrious / NoobAI 系模型": "aipm-illustrious-booru",
     "Anima 系列": "aipm-illustrious-booru",
     "FLUX.1 / FLUX.2 系列": "aipm-flux-natural",
+    "FLUX.1 文生图": "aipm-flux-natural",
+    "FLUX.2 文生图": "aipm-flux2-natural",
+    "FLUX.2 多参考编辑": "aipm-flux2-edit",
     "HiDream Image 系列": "aipm-flux-natural",
     "Chroma 系列": "aipm-flux-natural",
     "PixArt Sigma 系列": "aipm-flux-natural",
     "Stable Cascade": "aipm-flux-natural",
     "Krea 2 / Krea 2 Turbo 系列": "aipm-krea2-director",
+    "Krea 2 / Krea 2 Turbo 文生图": "aipm-krea2-director",
+    "Krea 2 风格参考": "aipm-krea2-style-reference",
+    "Krea 2 身份编辑": "aipm-krea2-identity-edit",
     "Qwen Image 系列": "aipm-chinese-multimodal",
+    "Qwen Image 文生图": "aipm-qwen-image-generate",
+    "Qwen Image 单图编辑": "aipm-qwen-image-edit",
+    "Qwen Image 多图编辑": "aipm-qwen-image-edit",
     "Z-Image 系列": "aipm-chinese-multimodal",
     "HunyuanImage 系列": "aipm-chinese-multimodal",
     "Kolors 系列": "aipm-chinese-multimodal",
@@ -130,9 +163,9 @@ VIDEO_PROMPT_SKILL_BY_PROFILE = {
     "MiniMax H3（自动判断模式）": "aipm-minimax-h3-video",
     "MiniMax H3 Ref2VA（多参考）": "aipm-minimax-h3-video",
     "MiniMax H3 FL2VA（首尾帧）": "aipm-minimax-h3-video",
-    "Wan 系列": "aipm-video-general",
-    "LTX-Video 系列": "aipm-video-general",
-    "HunyuanVideo 系列": "aipm-video-general",
+    "Wan 系列": "aipm-wan-video",
+    "LTX-Video 系列": "aipm-ltx-video",
+    "HunyuanVideo 系列": "aipm-hunyuan-video",
     "中文自然语言视频模型（通用）": "aipm-video-general",
 }
 REFINEMENT_MODEL_PROFILES = [
@@ -453,7 +486,7 @@ class AIPMImagePrompt:
                 "画面描述与创作要求": ("STRING", {"default": "", "multiline": True, "dynamicPrompts": False}),
                 "远程服务地址": ("STRING", {"default": "http://192.168.10.27:8080/v1"}),
                 "模型名称": ("STRING", {"default": "Huihui-Qwen3.8-27B-abliterated-Q5_K.gguf"}),
-                "目标生图模型": (IMAGE_MODEL_PROFILES, {"default": "Krea 2 / Krea 2 Turbo 系列"}),
+                "目标生图模型": (IMAGE_MODEL_PROFILES, {"default": "Krea 2 / Krea 2 Turbo 文生图"}),
                 "画面比例": (["自动", "1:1", "16:9", "9:16", "4:3", "3:4", "21:9"],),
                 "提示词语言": (["自动适配（推荐）", "中文", "English"],),
                 "参考图用途": (["多参考改图", "仅分析参考"], {"default": "多参考改图"}),
@@ -504,7 +537,7 @@ class AIPMVideoPrompt:
                 "远程服务地址": ("STRING", {"default": "http://192.168.10.27:8080/v1"}),
                 "模型名称": ("STRING", {"default": "Huihui-Qwen3.8-27B-abliterated-Q5_K.gguf"}),
                 "目标视频模型": (VIDEO_MODEL_PROFILES,),
-                "生成模式": (["自动判断（推荐）", "文生视频", "多参考 Ref2VA", "首尾帧 FL2VA"],),
+                "生成模式": (["自动判断（推荐）", "文生视频", "首帧 I2VA", "尾帧 L2VA", "首尾帧 FL2VA", "多参考 Ref2VA"],),
                 "视频时长": ("INT", {"default": 5, "min": 4, "max": 15, "step": 1, "display": "number"}),
                 "构图比例": (["自动", "16:9", "9:16", "1:1", "4:3", "3:4", "21:9"], {
                     "tooltip": "仅用于指导 AI 编写构图提示词；实际生成尺寸由工作流的宽度、高度节点控制。"
@@ -547,6 +580,10 @@ class AIPMVideoPrompt:
             return "h3_ref2va"
         if "FL2VA" in profile or requested == "首尾帧 FL2VA":
             return "h3_fl2va"
+        if requested == "首帧 I2VA":
+            return "h3_i2va"
+        if requested == "尾帧 L2VA":
+            return "h3_l2va"
         if requested == "文生视频":
             return "text_to_video"
         if profile.startswith("MiniMax H3") and (image_count or has_video or has_audio):
@@ -1022,6 +1059,9 @@ class AIPMVideoPrompt:
         mode = self._resolve_mode(profile, str(生成模式), len(reference_profiles), video1 is not None, audio1 is not None)
         if mode == "h3_fl2va" and len(reference_profiles) > 2:
             raise PromptAssistantError("MiniMax H3 FL2VA 最多接收两张图片：首帧与尾帧")
+        if mode in {"h3_i2va", "h3_l2va"} and len(reference_profiles) != 1:
+            label = "I2VA 首帧" if mode == "h3_i2va" else "L2VA 尾帧"
+            raise PromptAssistantError(f"MiniMax H3 {label} 模式必须正好连接一张图片")
         if mode == "h3_ref2va" and audio1 is not None and not reference_profiles and video1 is None:
             raise PromptAssistantError("MiniMax H3 Ref2VA 不能只输入声音，至少还需要图片或视频参考")
         skill_id, skill = load_prompt_skill(profile, mode)
@@ -1249,7 +1289,7 @@ class AIPMImagePrompt:
                 "画面描述与创作要求": ("STRING", {"default": "", "multiline": True, "dynamicPrompts": False}),
                 "远程服务地址": ("STRING", {"default": "http://192.168.10.27:8080/v1"}),
                 "模型名称": ("STRING", {"default": "Huihui-Qwen3.8-27B-abliterated-Q5_K.gguf"}),
-                "目标生图模型": (IMAGE_MODEL_PROFILES, {"default": "Krea 2 / Krea 2 Turbo 系列"}),
+                "目标生图模型": (IMAGE_MODEL_PROFILES, {"default": "Krea 2 / Krea 2 Turbo 文生图"}),
                 "画面比例": (["自动", "1:1", "16:9", "9:16", "4:3", "3:4", "21:9"],),
                 "提示词语言": (["自动适配（推荐）", "中文", "English"],),
                 "参考图用途": (["多参考改图", "仅分析参考"], {"default": "多参考改图"}),
@@ -1327,6 +1367,26 @@ class AIPMImagePrompt:
             raise PromptAssistantError(
                 "当前目标模型要求英文可执行提示词；positive_prompt、negative_prompt 和 reference_usage 不得包含中文"
             )
+
+    @staticmethod
+    def validate_reference_usage(candidate: dict[str, Any], reference_count: int, reference_mode: str) -> None:
+        """Require an explicit one-to-one role for every executable reference input."""
+        if reference_count <= 0 or reference_mode != "多参考改图":
+            return
+        usage = candidate.get("reference_usage")
+        if not isinstance(usage, list):
+            raise PromptAssistantError("多参考改图必须返回 reference_usage 数组")
+        joined = "\n".join(str(value or "") for value in usage)
+        missing = [f"<Picture {index}>" for index in range(1, reference_count + 1)
+                   if f"<Picture {index}>" not in joined]
+        if missing:
+            raise PromptAssistantError(f"多参考职责缺失：{', '.join(missing)}")
+
+    @classmethod
+    def validate_generated_result(cls, candidate: dict[str, Any], prompt_language: str,
+                                  reference_count: int, reference_mode: str) -> None:
+        cls.validate_generated_language(candidate, prompt_language)
+        cls.validate_reference_usage(candidate, reference_count, reference_mode)
 
     def generate(self, 画面描述与创作要求, 远程服务地址, 模型名称, 目标生图模型, 画面比例,
                  提示词语言, image1=None,
@@ -1499,7 +1559,9 @@ class AIPMImagePrompt:
             远程服务地址,
             payload,
             "生图提示词生成",
-            validator=lambda candidate: self.validate_generated_language(candidate, resolved_language),
+            validator=lambda candidate: self.validate_generated_result(
+                candidate, resolved_language, len(reference_profiles), reference_mode,
+            ),
         )
         reference_usage = result.get("reference_usage") if isinstance(result.get("reference_usage"), list) else []
         reference_binding_prompt = (

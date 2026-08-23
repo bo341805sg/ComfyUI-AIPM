@@ -22,7 +22,7 @@ class PromptAssistantTests(unittest.TestCase):
 
     def test_image_node_defaults_to_krea_2(self):
         target = nodes.AIPMImagePrompt.INPUT_TYPES()["required"]["目标生图模型"]
-        self.assertEqual(target[1]["default"], "Krea 2 / Krea 2 Turbo 系列")
+        self.assertEqual(target[1]["default"], "Krea 2 / Krea 2 Turbo 文生图")
 
     def test_image_reference_purpose_defaults_to_multi_reference_editing(self):
         purpose = nodes.AIPMImagePrompt.INPUT_TYPES()["required"]["参考图用途"]
@@ -67,15 +67,6 @@ class PromptAssistantTests(unittest.TestCase):
         self.assertIn("node.onSerialize = serialize", ui)
         self.assertIn("previousResult.value = String(this.properties.aipm_previous_result)", ui)
 
-    def test_all_prompt_nodes_have_offline_cached_output_button(self):
-        ui = (ROOT / "web" / "aipm_ui.js").read_text(encoding="utf-8")
-        self.assertIn('cacheButton.textContent = "输出缓存"', ui)
-        self.assertIn("actions.append(button, reviseButton, cacheButton)", ui)
-        self.assertIn("grid-template-columns:repeat(3,minmax(0,1fr))", ui)
-        self.assertIn('setStatus("正在从本地缓存重新输出，不调用远程服务……")', ui)
-        self.assertIn('currentAction === "cache"', ui)
-        self.assertIn('"AIPMImagePrompt", "AIPMVideoPrompt", "AIPMPromptRefinement"', ui)
-
     def test_video_result_is_immediately_written_to_linked_cinetimeline(self):
         ui = (ROOT / "web" / "aipm_ui.js").read_text(encoding="utf-8")
         self.assertIn("function writeResultToLinkedCineTimelines(node, rawTimelineJson)", ui)
@@ -92,6 +83,15 @@ class PromptAssistantTests(unittest.TestCase):
         self.assertIn("function syncGeneratePanelWidth(node)", ui)
         self.assertIn("panel.widget.computedWidth = width", ui)
         self.assertIn("requestAnimationFrame(() => syncGeneratePanelWidth(this))", ui)
+
+    def test_all_prompt_nodes_have_offline_cached_output_button(self):
+        ui = (ROOT / "web" / "aipm_ui.js").read_text(encoding="utf-8")
+        self.assertIn('cacheButton.textContent = "输出缓存"', ui)
+        self.assertIn("actions.append(button, reviseButton, cacheButton)", ui)
+        self.assertIn("grid-template-columns:repeat(3,minmax(0,1fr))", ui)
+        self.assertIn('setStatus("正在从本地缓存重新输出，不调用远程服务……")', ui)
+        self.assertIn('currentAction === "cache"', ui)
+        self.assertIn('"AIPMImagePrompt", "AIPMVideoPrompt", "AIPMPromptRefinement"', ui)
 
     def test_video_node_reuses_original_outputs_for_cinetimeline(self):
         node = nodes.AIPMVideoPromptCore
@@ -182,9 +182,10 @@ class PromptAssistantTests(unittest.TestCase):
         self.assertIn("中文自然语言（闭源模型通用）", choices)
         self.assertIn("Stable Diffusion 1.x", choices)
         self.assertIn("Pony Diffusion / Pony 系模型", choices)
-        self.assertIn("FLUX.1 / FLUX.2 系列", choices)
-        self.assertIn("Krea 2 / Krea 2 Turbo 系列", choices)
-        self.assertLessEqual(len(choices), 20)
+        self.assertIn("FLUX.2 多参考编辑", choices)
+        self.assertIn("Krea 2 身份编辑", choices)
+        self.assertIn("Qwen Image 多图编辑", choices)
+        self.assertLessEqual(len(choices), 25)
         self.assertTrue(set(choices).issubset(nodes.PROMPT_SKILL_BY_PROFILE))
 
     def test_each_profile_loads_a_nonempty_specialized_skill(self):
@@ -195,10 +196,27 @@ class PromptAssistantTests(unittest.TestCase):
             self.assertTrue(instructions.startswith("# "))
             self.assertNotIn("[TODO", instructions)
         self.assertEqual(loaded["Pony Diffusion / Pony 系模型"], "aipm-pony-booru")
-        self.assertEqual(loaded["Krea 2 / Krea 2 Turbo 系列"], "aipm-krea2-director")
-        self.assertEqual(loaded["Qwen Image 系列"], "aipm-chinese-multimodal")
+        self.assertEqual(loaded["Krea 2 / Krea 2 Turbo 文生图"], "aipm-krea2-director")
+        self.assertEqual(loaded["Krea 2 身份编辑"], "aipm-krea2-identity-edit")
+        self.assertEqual(loaded["FLUX.2 多参考编辑"], "aipm-flux2-edit")
+        self.assertEqual(loaded["Qwen Image 多图编辑"], "aipm-qwen-image-edit")
         self.assertTrue(nodes.NATIVE_QUALITY_ANCHORS["Pony Diffusion / Pony 系模型"].startswith("score_9"))
         self.assertIn("masterpiece", nodes.NATIVE_QUALITY_ANCHORS["Illustrious / NoobAI 系模型"])
+
+    def test_release_matrix_covers_every_active_specialized_skill(self):
+        matrix = json.loads((ROOT / "tests" / "skill_release_matrix.json").read_text(encoding="utf-8"))
+        covered = {item["skill"] for item in matrix["scenarios"]}
+        active = {
+            nodes.load_prompt_skill(profile)[0]
+            for profile in [*nodes.IMAGE_MODEL_PROFILES, *nodes.VIDEO_MODEL_PROFILES]
+        }
+        exempt_fallbacks = {
+            "aipm-general-natural", "aipm-sd-weighted", "aipm-pony-booru",
+            "aipm-sd3-modern", "aipm-chinese-multimodal", "aipm-video-general",
+        }
+        self.assertFalse((active - exempt_fallbacks) - covered)
+        self.assertEqual(matrix["release_gate"]["compare"], ["without_skill", "with_skill"])
+        self.assertGreaterEqual(len(matrix["scenarios"]), 15)
 
     def test_automatic_language_follows_model_prompt_dialect(self):
         self.assertEqual(nodes.resolve_prompt_language("Qwen Image 系列", "自动适配（推荐）"), "zh-CN")
@@ -231,6 +249,17 @@ class PromptAssistantTests(unittest.TestCase):
         self.assertIn("image1 (reference image 1)", binding)
         self.assertNotRegex(binding, r"[\u3400-\u9fff]")
 
+    def test_multi_reference_result_requires_every_picture_role(self):
+        candidate = {
+            "positive_prompt": "Two distinct people in a studio",
+            "negative_prompt": "",
+            "reference_usage": ["<Picture 1> defines the woman on the left"],
+        }
+        with self.assertRaisesRegex(nodes.PromptAssistantError, "<Picture 2>"):
+            nodes.AIPMImagePrompt.validate_generated_result(candidate, "en", 2, "多参考改图")
+        candidate["reference_usage"].append("<Picture 2> defines the man on the right")
+        nodes.AIPMImagePrompt.validate_generated_result(candidate, "en", 2, "多参考改图")
+
     def test_official_prompt_family_rules_are_preserved(self):
         _, flux = nodes.load_prompt_skill("FLUX.1 / FLUX.2 系列")
         _, qwen = nodes.load_prompt_skill("Qwen Image 系列")
@@ -243,6 +272,28 @@ class PromptAssistantTests(unittest.TestCase):
         self.assertIn("NoobAI XL 1.1 官方模型卡", noobai)
         self.assertNotIn("Stable Diffusion 1.x", nodes.NATIVE_QUALITY_ANCHORS)
         self.assertNotIn("Stable Diffusion XL 基础模型", nodes.NATIVE_QUALITY_ANCHORS)
+
+    def test_h3_skill_loads_only_the_selected_official_mode_contract(self):
+        _, base = nodes.load_prompt_skill("MiniMax H3 FL2VA（首尾帧）", "h3_fl2va")
+        _, ref = nodes.load_prompt_skill("MiniMax H3 Ref2VA（多参考）", "h3_ref2va")
+        self.assertIn("# Official Base-mode contract", base)
+        self.assertNotIn("# Official Ref2VA contract", base)
+        self.assertIn("# Official Ref2VA contract", ref)
+        self.assertNotIn("# Official Base-mode contract", ref)
+
+    def test_h3_structure_validation_enforces_mode_order_and_timestamps(self):
+        base = (
+            "integrated_multimodal_description: [Shot 1] 角色听见响声后停步，缓慢回头并在结尾站稳，"
+            "镜头小幅推近，呼吸与衣料摩擦同步。\n\n"
+            "overall_soundscape: 雨声、脚步声和短促吸气。\n\n"
+            "non_diegetic_music: N/A"
+        )
+        nodes.AIPMVideoPromptCore.validate_h3_structure(base, "text_to_video", 8)
+        with self.assertRaises(nodes.PromptAssistantError):
+            nodes.AIPMVideoPromptCore.validate_h3_structure(base, "h3_ref2va", 8)
+        invalid_time = base.replace("[Shot 1]", "[Shot 1] [Shot 2] At 00:08.000,")
+        with self.assertRaises(nodes.PromptAssistantError):
+            nodes.AIPMVideoPromptCore.validate_h3_structure(invalid_time, "text_to_video", 8)
 
     def test_extracts_fenced_json(self):
         value = nodes.OpenAICompatibleClient.parse_object('```json\n{"positive_prompt":"中文"}\n```')
@@ -380,6 +431,16 @@ class PromptAssistantTests(unittest.TestCase):
         self.assertEqual(resolve("MiniMax H3（自动判断模式）", "自动判断（推荐）", 0, False, False), "text_to_video")
         self.assertEqual(resolve("MiniMax H3（自动判断模式）", "自动判断（推荐）", 1, False, False), "h3_ref2va")
         self.assertEqual(resolve("MiniMax H3 FL2VA（首尾帧）", "自动判断（推荐）", 2, False, False), "h3_fl2va")
+        self.assertEqual(resolve("MiniMax H3（自动判断模式）", "首帧 I2VA", 1, False, False), "h3_i2va")
+        self.assertEqual(resolve("MiniMax H3（自动判断模式）", "尾帧 L2VA", 1, False, False), "h3_l2va")
+
+    def test_specialized_video_profiles_do_not_use_generic_fallback(self):
+        self.assertEqual(nodes.load_prompt_skill("Wan 系列")[0], "aipm-wan-video")
+        self.assertEqual(nodes.load_prompt_skill("LTX-Video 系列")[0], "aipm-ltx-video")
+        self.assertEqual(nodes.load_prompt_skill("HunyuanVideo 系列")[0], "aipm-hunyuan-video")
+        modes = nodes.AIPMVideoPromptCore.INPUT_TYPES()["required"]["生成模式"][0]
+        self.assertIn("首帧 I2VA", modes)
+        self.assertIn("尾帧 L2VA", modes)
 
     def test_timeline_plan_schema_requires_exact_segment_count(self):
         schema = nodes.AIPMVideoPromptCore.timeline_plan_format(3)["json_schema"]["schema"]
@@ -647,7 +708,7 @@ class PromptAssistantTests(unittest.TestCase):
         self.assertIn("遇到的问题与修改目标", inputs["required"])
         target = inputs["required"]["目标模型"]
         self.assertIsInstance(target[0], list)
-        self.assertIn("Krea 2 / Krea 2 Turbo 系列", target[0])
+        self.assertIn("Krea 2 / Krea 2 Turbo 文生图", target[0])
         self.assertIn("MiniMax H3（自动判断模式）", target[0])
         self.assertEqual(target[1]["default"], "自动判断 / 通用（推荐）")
         self.assertEqual(nodes.AIPMPromptRefinement.RETURN_NAMES[-1], "完整结果 JSON")

@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "updated": "2026-08-23",
+  "release_gate": {
+    "required_models": ["remote-primary", "remote-secondary", "local-fallback"],
+    "compare": ["without_skill", "with_skill"],
+    "block_on": ["critical_negative_delta", "universal_failure", "missing_reference_binding"]
+  },
+  "scenarios": [
+    {"id": "krea2_t2i_faithful", "skill": "aipm-krea2-director", "capability": "faithful text-to-image without invented subjects"},
+    {"id": "krea2_style_no_subject_leak", "skill": "aipm-krea2-style-reference", "capability": "style transfer without subject or layout leakage"},
+    {"id": "krea2_two_identity_edit", "skill": "aipm-krea2-identity-edit", "capability": "two identities remain separate and unedited person is protected"},
+    {"id": "flux1_typography", "skill": "aipm-flux-natural", "capability": "exact quoted typography and coherent composition"},
+    {"id": "flux2_t2i_prompt_upsample_safe", "skill": "aipm-flux2-natural", "capability": "intent remains stable with optional upstream expansion"},
+    {"id": "flux2_three_reference_composite", "skill": "aipm-flux2-edit", "capability": "all three references have unique source and destination roles"},
+    {"id": "qwen_t2i_chinese_poster", "skill": "aipm-qwen-image-generate", "capability": "Chinese art direction with exact visible text"},
+    {"id": "qwen_single_edit_preservation", "skill": "aipm-qwen-image-edit", "capability": "local edit preserves all unrequested content"},
+    {"id": "qwen_multi_edit_identity", "skill": "aipm-qwen-image-edit", "capability": "multi-image sources remain explicit and identities do not blend"},
+    {"id": "wan_i2v_opening_contract", "skill": "aipm-wan-video", "capability": "motion develops from visible opening state without redesign"},
+    {"id": "ltx_short_clip_salience", "skill": "aipm-ltx-video", "capability": "action and camera behavior remain front-loaded under noisy context"},
+    {"id": "hunyuan_layered_motion", "skill": "aipm-hunyuan-video", "capability": "subject environment and camera motion remain coordinated"},
+    {"id": "h3_base_format", "skill": "aipm-minimax-h3-video", "capability": "Base fields timestamps dialogue and Chinese body remain valid"},
+    {"id": "h3_ref2va_four_media", "skill": "aipm-minimax-h3-video", "capability": "reference labels roles retention and audio remain consistent"},
+    {"id": "booru_family_isolation", "skill": "aipm-illustrious-booru", "capability": "NoobAI and Pony prefixes do not cross-contaminate"},
+    {"id": "refinement_minimal_repair", "skill": "aipm-prompt-refinement", "capability": "repair fixes named defect without changing protected content"}
+  ],
+  "runs": []
+}
