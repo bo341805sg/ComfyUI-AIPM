@@ -1,7 +1,7 @@
 import { app } from "../../../scripts/app.js";
 import { api } from "../../../scripts/api.js";
 
-const VERSION = 38;
+const VERSION = 39;
 const AIPM_MIN_WIDTH = 480;
 const REVISION_MARKER = "__AIPM_REVISION_V1__";
 const RUN_MARKER = "__AIPM_RUN_V1__";
@@ -336,13 +336,28 @@ function installGeneratePanel(node) {
     app.graph?.setDirtyCanvas(true, true);
   };
 
+  const cachedAuthoring = () => {
+    try {
+      const value = JSON.parse(String(node.properties?.aipm_previous_result || ""));
+      return value?.schema === "cine_timeline" ? value?.metadata?.aipm : value;
+    } catch (_) {
+      return null;
+    }
+  };
+
+  const hasInterruptedVideo = () =>
+    !isRefinement && cachedAuthoring()?.generation_status === "interrupted";
+
   const updateRevisionAvailability = () => {
     const hasCache = Boolean(String(node.properties?.aipm_previous_result || "").trim());
     reviseButton.disabled = running || !hasCache;
     cacheButton.disabled = running || !hasCache;
+    if (!running && hasInterruptedVideo()) button.textContent = "继续生成";
   };
 
   const queueCurrentOutputs = async () => {
+    // Queue direct text-preview consumers as execution endpoints. This keeps
+    // prompt assistants independent from the expensive generation chain.
     const previewNodeIds = new Set();
     for (const output of node.outputs || []) {
       for (const linkId of output?.links || []) {
@@ -380,7 +395,7 @@ function installGeneratePanel(node) {
       return;
     }
     running = true;
-    currentAction = revise ? "revise" : "generate";
+    currentAction = revise ? "revise" : (hasInterruptedVideo() ? "resume" : "generate");
     if (revise && modification) {
       modification.value = REVISION_MARKER + JSON.stringify({
         instruction: originalModification,
@@ -390,7 +405,9 @@ function installGeneratePanel(node) {
       if (modification) modification.value = isRefinement
         ? `${RUN_MARKER}${originalModification}`
         : `${RUN_MARKER}${Date.now()}`;
-      if (previousResult) previousResult.value = "";
+      // Preserve an interrupted video package as a resumable checkpoint.
+      // Complete packages are still ignored by the backend on a fresh run.
+      if (previousResult) previousResult.value = String(node.properties?.aipm_previous_result || "");
     }
     if (referenceManifest) {
       referenceManifest.value = JSON.stringify(collectReferenceAssetManifest(node));
@@ -399,7 +416,11 @@ function installGeneratePanel(node) {
     reviseButton.disabled = true;
     cacheButton.disabled = true;
     clearButton.disabled = true;
-    setStatus(revise ? "正在保留未修改内容并定向优化……" : "正在分析输入并生成专业提示词……");
+    setStatus(revise
+      ? "正在保留未修改内容并定向优化……"
+      : currentAction === "resume"
+        ? "正在从上次失败分段继续生成……"
+        : "正在分析输入并生成专业提示词……");
     const previousMode = node.mode;
     node.mode = 0;
     if (previousResult && !node.widgets?.includes(previousResult)) {
@@ -441,6 +462,9 @@ function installGeneratePanel(node) {
     running = true;
     currentAction = "cache";
     if (previousResult) previousResult.value = cached;
+    // Image/video nodes interpret a non-empty modification as a revision.
+    // Refinement nodes can keep their issue text because their cached branch
+    // is selected whenever no independent execution marker is present.
     if (modification && !isRefinement) modification.value = "";
     button.disabled = true;
     reviseButton.disabled = true;
@@ -482,11 +506,15 @@ function installGeneratePanel(node) {
 
   const acceptResult = (output) => {
     const raw = output?.text?.[2];
+    let authoring = null;
     if (raw) {
       node.properties ||= {};
       node.properties.aipm_previous_result = String(raw);
       if (previousResult) previousResult.value = String(raw);
-      writeResultToLinkedCineTimelines(node, raw);
+      authoring = cachedAuthoring();
+      if (authoring?.generation_status !== "interrupted") {
+        writeResultToLinkedCineTimelines(node, raw);
+      }
     }
     app.graph?.change?.();
     updateRevisionAvailability();
@@ -496,13 +524,20 @@ function installGeneratePanel(node) {
     reviseButton.disabled = false;
     cacheButton.disabled = false;
     clearButton.disabled = false;
-    button.textContent = isRefinement ? "分析并细化" : "生成 / 重新创作";
+    button.textContent = isRefinement
+      ? "分析并细化"
+      : authoring?.generation_status === "interrupted" ? "继续生成" : "生成 / 重新创作";
     reviseButton.textContent = isRefinement ? "根据新意见继续细化" : "按修改意见优化";
-    setStatus(currentAction === "cache"
+    if (authoring?.generation_status === "interrupted") {
+      const next = Number(authoring?.resume_from_segment || 1);
+      setStatus(`第 ${next} 段连续失败 2 次，已保留前面完成的分段；再次点击“继续生成”将从本段继续。`, "error");
+    } else setStatus(currentAction === "cache"
       ? "缓存已重新输出，未调用远程服务。"
       : currentAction === "revise"
         ? "提示词优化完成，已保存为新的有效版本。"
-        : "提示词生成完成，已保存为上次有效结果。", "ok");
+        : currentAction === "resume"
+          ? "剩余分段生成完成，已保存完整结果。"
+          : "提示词生成完成，已保存为上次有效结果。", "ok");
   };
   const executed = ({ detail }) => {
     if (String(detail?.node ?? detail?.display_node ?? "") !== String(node.id)) return;

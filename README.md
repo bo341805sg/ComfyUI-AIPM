@@ -17,6 +17,7 @@
 - 最多三张生图参考图的逐图分析、`image1/image2/image3` 有序绑定和完整职责校验。
 - MiniMax H3 T2VA、I2VA、L2VA、FL2VA、Ref2VA，以及 Wan、LTX-Video、HunyuanVideo 专用技能。
 - 多分段视频提示词、台词/说话人、声音、摄影、表演、连续性与 CineTimeline JSON 输出。
+- 多段生成按段保存检查点；单段连续失败 2 次后中断，再次点击从失败段继续，完整完成后再次生成才从头开始。
 - 基于上次结果的最小必要提示词修复。
 
 ## 远程服务
@@ -33,7 +34,7 @@
 python -m unittest discover -s tests -v
 ```
 
-当前回归测试：51 项。
+当前回归测试：52 项。
 
 ## License
 

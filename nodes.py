@@ -752,6 +752,19 @@ class AIPMVideoPrompt:
             reference_ids.append("<Video 1>")
         if has_audio:
             reference_ids.append("<Audio 1>")
+        resume_key = hashlib.sha256(json.dumps({
+            "service_model": service_model, "profile": profile, "mode": mode,
+            "idea": idea, "duration_seconds": duration_seconds,
+            "segment_count": segment_count, "aspect_ratio": aspect_ratio,
+            "requested_language": requested_language,
+            "reference_ids": reference_ids,
+        }, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+        resumable = bool(
+            isinstance(previous, dict)
+            and previous.get("generation_status") == "interrupted"
+            and previous.get("resume_key") == resume_key
+            and isinstance(previous.get("timeline_plan"), dict)
+        )
         plan_context = {
             "task": "规划全局与分段提示词", "idea": idea, "segment_count": segment_count,
             "default_segment_duration": duration_seconds, "target_model": profile,
@@ -791,9 +804,14 @@ class AIPMVideoPrompt:
                 raise PromptAssistantError("创作要求需要台词，但时间线规划没有产出任何实际台词正文")
 
         try:
-            plan, plan_response = OpenAICompatibleClient.request_object(
-                service_url, plan_payload, "时间线规划", attempts=3, validator=validate_plan,
-            )
+            if resumable:
+                plan = copy.deepcopy(previous["timeline_plan"])
+                validate_plan(plan)
+                plan_response = {"usage": {}, "aipm_resume": True}
+            else:
+                plan, plan_response = OpenAICompatibleClient.request_object(
+                    service_url, plan_payload, "时间线规划", attempts=3, validator=validate_plan,
+                )
         except PromptAssistantError:
             # Small local fallback: some llama.cpp JSON-schema backends truncate
             # even a one-segment planning object. Planning is only routing data;
@@ -825,10 +843,17 @@ class AIPMVideoPrompt:
         global_prompt = str(plan.get("global_prompt") or "").strip()
         global_negative = str(plan.get("global_negative_prompt") or "").strip()
         global_reference_ids = [str(value) for value in plan.get("global_reference_ids", []) if str(value) in reference_ids]
-        segment_results = []
-        usage_records = [plan_response.get("usage") or {}]
-        previous_end = ""
-        for index, segment_plan in enumerate(segments_plan):
+        segment_results = copy.deepcopy(previous.get("segments") or []) if resumable else []
+        if len(segment_results) > segment_count:
+            segment_results = []
+            resumable = False
+        usage_records = copy.deepcopy(previous.get("usage", {}).get("stages") or []) if resumable else []
+        usage_records.append(plan_response.get("usage") or {})
+        previous_end = str(segment_results[-1].get("ending_state") or "") if segment_results else ""
+        start_index = len(segment_results)
+        interrupted_error = ""
+        failed_segment_id = ""
+        for index, segment_plan in enumerate(segments_plan[start_index:], start=start_index):
             segment_id = f"SEGMENT_{index + 1:03d}"
             segment_refs = [str(value) for value in segment_plan.get("reference_ids", []) if str(value) in reference_ids]
             active_refs = list(dict.fromkeys(global_reference_ids + segment_refs))
@@ -880,21 +905,26 @@ class AIPMVideoPrompt:
                     raise PromptAssistantError(
                         "当前分段规划包含台词，但生成结果缺少H3 <d>[语言]…</d>台词正文"
                     )
-            segment_prompt, segment_response = OpenAICompatibleClient.request_text(
-                service_url, text_payload, f"{segment_id} 提示词生成",
-                validator=validate_segment_text,
-            )
-            source_prompt = segment_prompt
-            timeline_local_prompt = self.bind_dialogue_speaker_ids(source_prompt, planned_dialogue)
-            compiled_prompt = self.compile_h3_prompt(
-                timeline_local_prompt, global_prompt, global_negative,
-            )
-            speaker_ids = set(re.findall(r"\(S\d+\)", timeline_local_prompt))
-            if planned_dialogue and len(speaker_ids) < len(expected_speakers):
-                raise PromptAssistantError(
-                    f"当前分段有 {len(expected_speakers)} 个发声角色，但本地只绑定了 "
-                    f"{len(speaker_ids)} 个H3 (SN)声纹编号"
+            try:
+                segment_prompt, segment_response = OpenAICompatibleClient.request_text(
+                    service_url, text_payload, f"{segment_id} 提示词生成", attempts=2,
+                    validator=validate_segment_text,
                 )
+                source_prompt = segment_prompt
+                timeline_local_prompt = self.bind_dialogue_speaker_ids(source_prompt, planned_dialogue)
+                compiled_prompt = self.compile_h3_prompt(
+                    timeline_local_prompt, global_prompt, global_negative,
+                )
+                speaker_ids = set(re.findall(r"\(S\d+\)", timeline_local_prompt))
+                if planned_dialogue and len(speaker_ids) < len(expected_speakers):
+                    raise PromptAssistantError(
+                        f"当前分段有 {len(expected_speakers)} 个发声角色，但本地只绑定了 "
+                        f"{len(speaker_ids)} 个H3 (SN)声纹编号"
+                    )
+            except PromptAssistantError as exc:
+                interrupted_error = str(exc)
+                failed_segment_id = segment_id
+                break
             usage_records.append(segment_response.get("usage") or {})
             opening_state = str(segment_plan.get("opening_state") or "").strip()
             ending_state = str(segment_plan.get("ending_state") or "").strip()
@@ -914,11 +944,15 @@ class AIPMVideoPrompt:
             })
             previous_end = ending_state
 
-        first = segment_results[0]
-        effective_negative = "，".join(value for value in [global_negative, first["negative_prompt"]] if value)
+        complete = len(segment_results) == segment_count and not interrupted_error
+        first = segment_results[0] if segment_results else None
+        effective_negative = "，".join(value for value in [
+            global_negative, first["negative_prompt"] if first else "",
+        ] if value)
         package = {
             "schema": "aipm_video_timeline", "version": "2.0", "prompt_skill_id": skill_id,
-            "revision": int(previous.get("revision") or 1) + 1 if previous else 1,
+            "revision": (int(previous.get("revision") or 1) if resumable
+                         else int(previous.get("revision") or 1) + 1 if previous else 1),
             "modification_request": modification if previous else "", "target_model": profile,
             "generation_mode": mode, "segment_count": segment_count,
             "default_segment_duration": duration_seconds, "total_duration": duration_seconds * segment_count,
@@ -928,7 +962,14 @@ class AIPMVideoPrompt:
                 "reference_ids": global_reference_ids,
                 "reference_bindings": plan.get("global_reference_bindings") or [],
             },
-            "segments": segment_results, "video_prompt": first["compiled_prompt"],
+            "generation_status": "complete" if complete else "interrupted",
+            "resume_key": resume_key,
+            "resume_from_segment": None if complete else len(segment_results) + 1,
+            "failed_segment_id": failed_segment_id,
+            "interruption_error": interrupted_error,
+            "timeline_plan": copy.deepcopy(plan),
+            "segments": segment_results,
+            "video_prompt": first["compiled_prompt"] if first else "",
             "negative_prompt": effective_negative,
             "audio_prompt": "声音设计已包含在各分段H3提示词的 overall_soundscape 与 non_diegetic_music 中。",
             "reference_count": len(reference_ids), "reference_profiles": reference_profiles,
@@ -937,7 +978,7 @@ class AIPMVideoPrompt:
                 "audios": copy.deepcopy(audio_assets or []),
             },
             "reference_analysis_cache_hits": cache_hits,
-            "processing_strategy": "reference-analysis -> compact-global-segment-plan -> per-segment-text -> local-package",
+            "processing_strategy": "reference-analysis -> compact-global-segment-plan -> resumable-per-segment-text -> local-package",
             "usage": {"stages": usage_records},
         }
         cine_timeline, cine_timeline_json = self._canonical_timeline(package)
@@ -1007,6 +1048,12 @@ class AIPMVideoPrompt:
             except json.JSONDecodeError as exc:
                 raise PromptAssistantError("已保存的视频提示词结果无效，请清空后重新生成") from exc
             authoring = self._authoring_data(stored)
+            if isinstance(authoring, dict) and authoring.get("generation_status") == "interrupted":
+                resume_from = int(authoring.get("resume_from_segment") or 1)
+                raise PromptAssistantError(
+                    f"AIPM多段提示词尚未完成，当前应从第 {resume_from} 段继续；"
+                    "请点击节点上的“生成 / 继续生成”，不要运行主工作流。"
+                )
             if (not isinstance(stored, dict)
                     or stored.get("schema") != "cine_timeline"
                     or not authoring.get("video_prompt")):
@@ -1023,15 +1070,18 @@ class AIPMVideoPrompt:
         if not independent_execution:
             raise PromptAssistantError("AIPM不会随主工作流调用远程AI。请先点击节点上的“生成 / 重新创作”按钮生成并缓存提示词。")
         previous = None
-        if modification and previous_json:
+        if previous_json and (modification or independent_execution):
             try:
                 candidate = json.loads(previous_json)
             except json.JSONDecodeError as exc:
                 raise PromptAssistantError("没有可用于修改的上次有效结果") from exc
             candidate = self._authoring_data(candidate)
-            if not isinstance(candidate, dict) or not candidate.get("video_prompt"):
-                raise PromptAssistantError("没有可用于修改的上次有效结果")
-            previous = candidate
+            if modification:
+                if not isinstance(candidate, dict) or not candidate.get("video_prompt"):
+                    raise PromptAssistantError("没有可用于修改的上次有效结果")
+                previous = candidate
+            elif isinstance(candidate, dict) and candidate.get("generation_status") == "interrupted":
+                previous = candidate
 
         asset_manifest = parse_reference_asset_manifest(参考素材清单JSON)
         image_assets = [item for item in asset_manifest if item.get("media_type") == "image"]

@@ -573,6 +573,76 @@ class PromptAssistantTests(unittest.TestCase):
         self.assertEqual(package["global"]["reference_ids"], ["<Picture 1>"])
         self.assertEqual(len(calls), 2)
 
+    def test_multi_segment_failure_returns_checkpoint_and_resumes_at_failed_segment(self):
+        node = nodes.AIPMVideoPromptCore()
+        original_object = nodes.OpenAICompatibleClient.request_object
+        original_text = nodes.OpenAICompatibleClient.request_text
+        plan = {
+            "global_prompt": "统一风格", "global_negative_prompt": "闪烁",
+            "global_reference_ids": [], "global_reference_bindings": [],
+            "segments": [{
+                "segment_id": f"SEGMENT_{index:03d}", "title": f"第{index}段",
+                "duration": 6, "brief": f"动作{index}", "negative_prompt": "",
+                "reference_ids": [], "dialogue_lines": [],
+                "opening_state": f"开场{index}", "ending_state": f"结尾{index}",
+                "continuity_from_previous": "" if index == 1 else "承接上一段",
+            } for index in range(1, 4)],
+        }
+        valid = (
+            "integrated_multimodal_description: [Shot 1] 人物在清晰稳定的环境中完成当前分段动作，"
+            "镜头保持连续并跟随主体，动作、呼吸、衣料和视线变化完整，最终在明确构图中稳定落定。\n\n"
+            "overall_soundscape: 连续环境声、脚步声和衣料摩擦准确同步。\n\n"
+            "non_diegetic_music: N/A"
+        )
+        calls = []
+        nodes.OpenAICompatibleClient.request_object = classmethod(
+            lambda cls, *args, **kwargs: (plan, {"usage": {"total_tokens": 5}})
+        )
+
+        def first_pass(cls, *args, **kwargs):
+            calls.append((args[2], kwargs.get("attempts")))
+            if len(calls) == 2:
+                raise nodes.PromptAssistantError("SEGMENT_002 提示词生成连续 2 次失败：测试错误")
+            return valid, {"usage": {"total_tokens": 7}}
+
+        nodes.OpenAICompatibleClient.request_text = classmethod(first_pass)
+        try:
+            interrupted = node.generate_timeline_package(
+                service_url="http://host/v1", service_model="model", profile="MiniMax H3（自动判断模式）",
+                mode="text_to_video", idea="三段连续动作", duration_seconds=6, segment_count=3,
+                aspect_ratio="16:9", requested_language="中文（推荐）", skill_id="aipm-minimax-h3-video",
+                skill="skill", reference_profiles=[], cache_hits=0, has_video=False, has_audio=False,
+                previous=None, modification="",
+            )
+            checkpoint = json.loads(interrupted["ui"]["text"][2])["metadata"]["aipm"]
+            self.assertEqual(checkpoint["generation_status"], "interrupted")
+            self.assertEqual(checkpoint["resume_from_segment"], 2)
+            self.assertEqual([item["segment_id"] for item in checkpoint["segments"]], ["SEGMENT_001"])
+            self.assertEqual(calls[1][1], 2)
+
+            resumed_calls = []
+            nodes.OpenAICompatibleClient.request_object = classmethod(
+                lambda cls, *args, **kwargs: (_ for _ in ()).throw(AssertionError("恢复时不应重新规划"))
+            )
+            nodes.OpenAICompatibleClient.request_text = classmethod(
+                lambda cls, *args, **kwargs: (resumed_calls.append(args[2]) or valid, {"usage": {"total_tokens": 7}})
+            )
+            completed = node.generate_timeline_package(
+                service_url="http://host/v1", service_model="model", profile="MiniMax H3（自动判断模式）",
+                mode="text_to_video", idea="三段连续动作", duration_seconds=6, segment_count=3,
+                aspect_ratio="16:9", requested_language="中文（推荐）", skill_id="aipm-minimax-h3-video",
+                skill="skill", reference_profiles=[], cache_hits=0, has_video=False, has_audio=False,
+                previous=checkpoint, modification="",
+            )
+        finally:
+            nodes.OpenAICompatibleClient.request_object = original_object
+            nodes.OpenAICompatibleClient.request_text = original_text
+        final_package = json.loads(completed["ui"]["text"][2])["metadata"]["aipm"]
+        self.assertEqual(final_package["generation_status"], "complete")
+        self.assertEqual([item["segment_id"] for item in final_package["segments"]],
+                         ["SEGMENT_001", "SEGMENT_002", "SEGMENT_003"])
+        self.assertEqual(resumed_calls, ["SEGMENT_002 提示词生成", "SEGMENT_003 提示词生成"])
+
     def test_video_node_returns_structured_package(self):
         node = nodes.AIPMVideoPromptCore()
         original_object = nodes.OpenAICompatibleClient.request_object
