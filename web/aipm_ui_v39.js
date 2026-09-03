@@ -1,1 +1,1 @@
-import "./aipm_ui.js?v=40";
+// Retired cache-busting entry. The canonical extension is aipm_ui.js.

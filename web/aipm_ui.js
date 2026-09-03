@@ -1,7 +1,10 @@
 import { app } from "../../../scripts/app.js";
 import { api } from "../../../scripts/api.js";
 
-const VERSION = 39;
+if (!globalThis.__COMFYUI_AIPM_UI_VERSION__ || globalThis.__COMFYUI_AIPM_UI_VERSION__ < 76) {
+  globalThis.__COMFYUI_AIPM_UI_VERSION__ = 76;
+
+const VERSION = 76;
 const AIPM_MIN_WIDTH = 480;
 const REVISION_MARKER = "__AIPM_REVISION_V1__";
 const RUN_MARKER = "__AIPM_RUN_V1__";
@@ -11,6 +14,10 @@ function removeOldPanel(node) {
   if (!oldPanel) return;
   oldPanel.cleanup?.();
   oldPanel.root?.remove?.();
+  for (const nativeWidget of oldPanel.nativeWidgets || []) {
+    const nativeIndex = node.widgets?.indexOf(nativeWidget) ?? -1;
+    if (nativeIndex >= 0) node.widgets.splice(nativeIndex, 1);
+  }
   const index = node.widgets?.indexOf(oldPanel.widget) ?? -1;
   if (index >= 0) node.widgets.splice(index, 1);
   delete node._aipmGeneratePanel;
@@ -35,29 +42,115 @@ function hideInternalWidget(widget) {
   }
 }
 
-function writeResultToLinkedCineTimelines(node, rawTimelineJson) {
-  const raw = String(rawTimelineJson || "").trim();
+function writeTextToLinkedPreviews(node, output) {
+  const graph = node?.graph || app.graph || app.rootGraph;
+  if (!graph) return 0;
+  const textValues = output?.text || [];
+  const valuesByName = {
+    "视频提示词": textValues[0],
+    "正向提示词": textValues[0],
+    "负向提示词": textValues[1],
+    "完整结果 JSON": textValues[2],
+  };
+  let updated = 0;
+  for (const source of node.outputs || []) {
+    const value = valuesByName[source?.name];
+    if (value == null) continue;
+    for (const linkId of source?.links || []) {
+      const link = graph.links?.[linkId] || graph.links?.get?.(linkId);
+      const target = link ? graph.getNodeById?.(link.target_id) : null;
+      const type = String(target?.type || target?.comfyClass || "").toLowerCase();
+      if (!target) continue;
+      if (type.includes("showtext") || type.includes("displaytext") || type.includes("previewtext")) {
+        target.onExecuted?.({ text: [String(value)] });
+      } else {
+        const targetInput = target.inputs?.[link.target_slot];
+        if (String(targetInput?.type || "").toUpperCase() !== "STRING") continue;
+        const widgetName = targetInput?.widget?.name || targetInput?.name;
+        const targetWidget = target.widgets?.find((widget) => widget.name === widgetName);
+        if (!targetWidget) continue;
+        targetWidget.value = String(value);
+        targetWidget.callback?.(targetWidget.value, app.canvas, target, app.canvas?.graph_mouse, {});
+      }
+      target.setDirtyCanvas?.(true, true);
+      updated += 1;
+    }
+  }
+  return updated;
+}
+
+function writeResultToLinkedCineTimelines(node, rawTimelineJson, strategy = "rewrite", targetSegmentId = "") {
+  let raw = String(rawTimelineJson || "").trim();
   if (!raw || String(node?.comfyClass || node?.type || "") !== "AIPMVideoPrompt") return 0;
+  let parsed;
   try {
-    const parsed = JSON.parse(raw);
-    if (parsed?.schema !== "cine_timeline" || !Array.isArray(parsed?.shots)) return 0;
+    parsed = JSON.parse(raw);
+    if (!["cine_timeline", "cine_keyframe_timeline"].includes(parsed?.schema) || !Array.isArray(parsed?.shots)) return 0;
   } catch {
     return 0;
   }
+  parsed.shots.forEach((shot, index) => {
+    shot.metadata = shot.metadata && typeof shot.metadata === "object" ? shot.metadata : {};
+    if (index === 0 || shot.metadata.new_scene === true) shot.transition = "cut";
+    else if (!["cut", "motion_context"].includes(shot.transition)) shot.transition = "motion_context";
+  });
+  raw = JSON.stringify(parsed);
   const jsonOutput = (node.outputs || []).find((output) => output?.name === "完整结果 JSON");
   let updated = 0;
   for (const linkId of jsonOutput?.links || []) {
     const link = app.graph?.links?.[linkId] || app.graph?.links?.get?.(linkId);
     const target = link ? app.graph?.getNodeById?.(link.target_id) : null;
-    if (!target || !["CineTimelinePlan", "CineTimelineStudio", "CineTimelineEditor"].includes(String(target.comfyClass || target.type || ""))) continue;
+    if (!target || ![
+      "CineTimelinePlan", "CineTimelineKeyframePlan", "CineTimelineStudio", "CineTimelineEditor",
+    ].includes(String(target.comfyClass || target.type || ""))) continue;
     const targetInput = target.inputs?.[link.target_slot];
     if (targetInput?.name !== "timeline_json") continue;
     const timelineWidget = target.widgets?.find((widget) => widget.name === "timeline_state");
     if (!timelineWidget) continue;
+    let current;
     try {
-      const current = JSON.parse(String(timelineWidget.value || "{}"));
-      if (String(current?.metadata?.render_target_shot_id || "").trim()) continue;
+      current = JSON.parse(String(timelineWidget.value || "{}"));
     } catch {}
+    let next = parsed;
+    if (strategy === "append" || strategy === "revise_segment") {
+      const incoming = parsed.shots || [];
+      const existing = Array.isArray(current?.shots) ? current.shots : [];
+      if (strategy === "append") {
+        const known = new Set(existing.map((shot) => String(shot?.shot_id || "")));
+        const additions = incoming.filter((shot) => !known.has(String(shot?.shot_id || "")));
+        const renderById = new Map(existing.map((shot) => [
+          String(shot?.shot_id || ""), shot?.metadata?.render,
+        ]));
+        // The adapter returns the complete post-append timeline, not only the
+        // new shots. Use it as the schedule/reference source so total_frames,
+        // keyframe positions and newly scoped references advance together.
+        // Preserve local render versions for existing shots because those are
+        // browser-owned production state and are intentionally absent from
+        // the AIPM authoring cache.
+        next = { ...parsed, shots: incoming.map((shot) => {
+          const oldRender = renderById.get(String(shot?.shot_id || ""));
+          return oldRender
+            ? { ...shot, metadata: { ...(shot.metadata || {}), render: oldRender } }
+            : shot;
+        }) };
+        if (!additions.length && incoming.length <= existing.length) continue;
+        if (Array.isArray(current?.background_music) && current.background_music.length) {
+          next.background_music = current.background_music;
+        }
+      } else {
+        const replacement = incoming.find((shot) => String(shot?.shot_id || "") === String(targetSegmentId));
+        if (!replacement) continue;
+        next = { ...current, shots: existing.map((shot) => {
+          if (String(shot?.shot_id || "") !== String(targetSegmentId)) return shot;
+          const oldRender = shot?.metadata?.render;
+          const merged = { ...replacement, metadata: { ...(replacement.metadata || {}) } };
+          if (oldRender) merged.metadata.render = { ...oldRender, status: "redo", active_version: "" };
+          return merged;
+        }) };
+      }
+      next.metadata = { ...(next.metadata || {}), aipm: parsed?.metadata?.aipm };
+      raw = JSON.stringify(next);
+    }
     timelineWidget.value = raw;
     timelineWidget.callback?.(raw);
     target.cineTimelineEditor?.reloadState?.();
@@ -77,7 +170,7 @@ function migrateVideoDurationWidget(node) {
   widget.value = seconds;
   widget.type = "number";
   widget.options = {
-    ...(widget.options || {}), min: 4, max: 15, step: 1, precision: 0,
+    ...(widget.options || {}), min: 4, max: 30, step: 1, precision: 0,
   };
   const input = node.inputs?.find((item) => item.name === "视频时长");
   if (input) input.type = "INT";
@@ -116,7 +209,61 @@ function configureStableNodeLayout(node) {
   if (node._aipmStableLayoutVersion === VERSION) return;
   node._aipmStableLayoutVersion = VERSION;
   node.properties ||= {};
+  // LiteGraph disables every native widget when the node itself is bypassed
+  // or muted. AIPM is safe in ALWAYS mode: ordinary workflow execution only
+  // emits its saved local cache; remote calls require an explicit button marker.
+  node.mode = 0;
   delete node.properties.aipm_locked_width;
+
+  const contentInput = node.widgets?.find((widget) =>
+    widget.name === "画面描述与创作要求" || widget.name === "视频内容与导演要求"
+  );
+  let resizeBaselineHeight = Math.max(1, Number(node.size?.[1]) || 300);
+  let contentBaselineHeight = 110;
+  if (contentInput) {
+    const measured = Number(contentInput.computeSize?.(Number(node.size?.[0]) || AIPM_MIN_WIDTH)?.[1]);
+    if (Number.isFinite(measured) && measured > 0) contentBaselineHeight = measured;
+    contentInput._aipmAdaptiveHeight = Math.max(72, contentBaselineHeight);
+    contentInput.computeSize = (width) => [width, contentInput._aipmAdaptiveHeight];
+  }
+  const originalComputeSize = node.computeSize;
+  if (contentInput && originalComputeSize) {
+    node.computeSize = function () {
+      const currentHeight = contentInput._aipmAdaptiveHeight;
+      contentInput._aipmAdaptiveHeight = 72;
+      try {
+        return originalComputeSize.apply(this, arguments);
+      } finally {
+        contentInput._aipmAdaptiveHeight = currentHeight;
+      }
+    };
+  }
+
+  const resizeContentInput = (nextHeight) => {
+    if (!contentInput || !Number.isFinite(Number(nextHeight))) return;
+    const adaptiveHeight = Math.max(72, contentBaselineHeight + Number(nextHeight) - resizeBaselineHeight);
+    contentInput._aipmAdaptiveHeight = adaptiveHeight;
+    const element = contentInput.element || contentInput.inputEl;
+    if (element?.style) {
+      const editorHeight = Math.max(62, adaptiveHeight - 10);
+      element.style.height = `${editorHeight}px`;
+      element.style.minHeight = `${editorHeight}px`;
+      element.style.maxHeight = `${editorHeight}px`;
+      element.style.resize = "none";
+    }
+  };
+  resizeContentInput(resizeBaselineHeight);
+  node._aipmFitContentInput = () => {
+    if (!contentInput || !node.size) return;
+    const width = Number(node.size[0]) || AIPM_MIN_WIDTH;
+    const targetHeight = Number(node.size[1]) || resizeBaselineHeight;
+    const naturalHeight = Number(originalComputeSize?.call(node, [width, 0])?.[1]) || targetHeight;
+    const fittedHeight = Math.max(72, contentInput._aipmAdaptiveHeight + targetHeight - naturalHeight - 8);
+    contentInput._aipmAdaptiveHeight = fittedHeight;
+    contentBaselineHeight = fittedHeight;
+    resizeBaselineHeight = targetHeight;
+    resizeContentInput(targetHeight);
+  };
 
   const modification = node.widgets?.find((widget) =>
     widget.name === "修改意见" || widget.name === "遇到的问题与修改目标"
@@ -146,6 +293,7 @@ function configureStableNodeLayout(node) {
   node.onResize = function (size) {
     const nextSize = Array.isArray(size) ? size : this.size;
     if (nextSize) nextSize[0] = Math.max(AIPM_MIN_WIDTH, Number(nextSize[0]) || AIPM_MIN_WIDTH);
+    if (nextSize) resizeContentInput(Number(nextSize[1]));
     const result = originalResize?.apply(this, arguments);
     if (this.size) this.size[0] = Math.max(AIPM_MIN_WIDTH, Number(this.size[0]) || AIPM_MIN_WIDTH);
     requestAnimationFrame(() => syncGeneratePanelWidth(this));
@@ -219,6 +367,49 @@ function migrateReferenceInputNames(node) {
   }
 }
 
+function dynamicReferenceLimits(node) {
+  const nodeType = String(node?.comfyClass || node?.type || "");
+  if (nodeType === "AIPMImagePrompt") return { image: 9 };
+  if (nodeType === "AIPMVideoPrompt") return { image: 9, video: 3, audio: 3 };
+  return {};
+}
+
+function syncDynamicReferenceInputs(node) {
+  if (node._aipmSyncingReferenceInputs) return;
+  const limits = dynamicReferenceLimits(node);
+  if (!Object.keys(limits).length) return;
+  node._aipmSyncingReferenceInputs = true;
+  try {
+    for (const [prefix, limit] of Object.entries(limits)) {
+      const pattern = new RegExp(`^${prefix}(\\d+)$`);
+      const matching = (node.inputs || []).map((input, slot) => {
+        const match = pattern.exec(String(input.name || ""));
+        return match ? { input, slot, number: Number(match[1]) } : null;
+      }).filter(Boolean);
+      const connectedNumbers = new Set(
+        matching.filter(({ input }) => input.link != null).map(({ number }) => number),
+      );
+      const availableNumber = Array.from({ length: limit }, (_, index) => index + 1)
+        .find((number) => !connectedNumbers.has(number));
+      // Keep every connected port and exactly one empty port. Removing from
+      // the end lets LiteGraph update target_slot indexes without invalidating
+      // earlier entries.
+      const removeSlots = matching
+        .filter(({ input, number }) => input.link == null && number !== availableNumber)
+        .map(({ slot }) => slot)
+        .sort((a, b) => b - a);
+      for (const slot of removeSlots) node.removeInput?.(slot);
+      if (availableNumber != null && !(node.inputs || []).some((input) => input.name === `${prefix}${availableNumber}`)) {
+        const type = prefix === "image" ? "IMAGE" : prefix === "video" ? "VIDEO" : "AUDIO";
+        node.addInput?.(`${prefix}${availableNumber}`, type);
+      }
+    }
+    node.setDirtyCanvas?.(true, true);
+  } finally {
+    node._aipmSyncingReferenceInputs = false;
+  }
+}
+
 function migrateModelNameWidget(node) {
   const oldDefault = "Qwen3.8-27B-Uncensored-Q5_K_M.gguf";
   const newDefault = "Huihui-Qwen3.8-27B-abliterated-Q5_K.gguf";
@@ -239,9 +430,15 @@ function migrateModelNameWidget(node) {
 function migrateImageModelDefault(node) {
   if (String(node?.comfyClass || node?.type || "") !== "AIPMImagePrompt") return;
   const widget = node.widgets?.find((item) => item.name === "目标生图模型");
-  if (widget?.value === "自动判断 / 通用（推荐）") {
-    widget.value = "Krea 2 / Krea 2 Turbo 系列";
+  if (["自动判断 / 通用（推荐）", "Krea 2 / Krea 2 Turbo 系列"].includes(String(widget?.value || ""))) {
+    widget.value = "Krea 2 / Krea 2 Turbo 文生图";
   }
+}
+
+function migrateVideoTargetModel(node) {
+  if (String(node?.comfyClass || node?.type || "") !== "AIPMVideoPrompt") return;
+  const widget = node.widgets?.find((item) => item.name === "目标视频模型");
+  if (widget) widget.value = "MiniMax H3";
 }
 
 function migrateImageReferencePurpose(node) {
@@ -250,6 +447,23 @@ function migrateImageReferencePurpose(node) {
   if (widget && !["多参考改图", "仅分析参考"].includes(String(widget.value || ""))) {
     widget.value = "多参考改图";
   }
+}
+
+function migrateVideoGenerationMode(node) {
+  if (String(node?.comfyClass || node?.type || "") !== "AIPMVideoPrompt") return;
+  const widget = node.widgets?.find((item) => item.name === "生成模式");
+  if (!widget) return;
+  const migration = {
+    "自动判断": "多模态",
+    "自动判断（推荐）": "多模态",
+    "文生视频": "关键帧",
+    "多参考 Ref2VA": "多模态",
+    "首帧 I2VA": "关键帧",
+    "尾帧 L2VA": "关键帧",
+    "首尾帧": "关键帧",
+    "首尾帧 FL2VA": "关键帧",
+  };
+  widget.value = migration[String(widget.value || "")] || widget.value || "多模态";
 }
 
 function migrateShiftedCachedResult(node) {
@@ -266,7 +480,7 @@ function migrateShiftedCachedResult(node) {
   const isImageCache = nodeType === "AIPMImagePrompt"
     && parsed?.schema === "aipm_image_prompt" && parsed?.positive_prompt;
   const isVideoCache = nodeType === "AIPMVideoPrompt"
-    && ["aipm_video_prompt", "cine_timeline"].includes(parsed?.schema);
+    && ["aipm_video_prompt", "cine_timeline", "cine_keyframe_timeline"].includes(parsed?.schema);
   if (!isImageCache && !isVideoCache) return;
   const previousResult = node.widgets?.find((item) => item.name === "上次结果JSON");
   node.properties ||= {};
@@ -285,64 +499,147 @@ function installGeneratePanel(node) {
   let running = false;
   let currentAction = "generate";
   const isRefinement = String(node?.comfyClass || node?.type || "") === "AIPMPromptRefinement";
+  const isVideo = String(node?.comfyClass || node?.type || "") === "AIPMVideoPrompt";
+  const isImage = String(node?.comfyClass || node?.type || "") === "AIPMImagePrompt";
   const previousResult = node.widgets?.find((item) => item.name === "上次结果JSON");
   const referenceManifest = node.widgets?.find((item) => item.name === "参考素材清单JSON");
+  const modificationInput = node.widgets?.find((item) => item.name === "修改意见");
   const previousResultIndex = Math.max(node.widgets?.indexOf(previousResult) ?? -1, 0);
   node.properties ||= {};
+  if (isVideo && ["重写时间轴", "续写时间轴"].includes(String(modificationInput?.value || ""))) {
+    const shiftedInstruction = String(referenceManifest?.value || "").trim();
+    let manifestIsValid = false;
+    try { manifestIsValid = Array.isArray(JSON.parse(shiftedInstruction)); } catch (_) {}
+    if (shiftedInstruction && !manifestIsValid) {
+      // v47-v49 could persist the two runtime combos ahead of the backend
+      // fields. Recover the user's instruction from the displaced manifest
+      // slot; the real manifest is rebuilt from connected references on run.
+      modificationInput.value = shiftedInstruction;
+      referenceManifest.value = "[]";
+    } else {
+      modificationInput.value = "";
+    }
+  }
   if (!node.properties.aipm_previous_result && String(previousResult?.value || "").trim()) {
     node.properties.aipm_previous_result = String(previousResult.value);
   }
   hideInternalWidget(previousResult);
   hideInternalWidget(referenceManifest);
 
-  const root = document.createElement("div");
-  root.className = "aipm-generate-panel";
-  root.innerHTML = `<style>
-    .aipm-generate-panel{box-sizing:border-box;width:100%;padding:7px 4px 11px;font:12px Inter,system-ui,sans-serif}
-    .aipm-generate-panel .actions{display:grid;width:100%;min-width:0;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px}
-    .aipm-generate-panel button{box-sizing:border-box;min-width:0;width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:7px 10px;border:1px solid #59759d;border-radius:6px;background:#293b55;color:#f3f7ff;font-weight:650;cursor:pointer}
-    .aipm-generate-panel button.secondary{background:#3a334e;border-color:#75638f}
-    .aipm-generate-panel button.clear{margin-top:6px;padding:4px 8px;background:transparent;border-color:#536273;color:#b9c5d4;font-weight:500}
-    .aipm-generate-panel button:hover{background:#354e70}.aipm-generate-panel button:disabled{opacity:.5;cursor:default}
-    .aipm-generate-panel .status{min-height:18px;padding:0 2px 5px;color:#aebdd0;white-space:normal;line-height:1.35}
-    .aipm-generate-panel .status.ok{color:#74d69b}.aipm-generate-panel .status.error{color:#ff8e98}
-  </style>`;
-  const button = document.createElement("button");
-  button.type = "button";
-  button.textContent = isRefinement ? "分析并细化" : "生成 / 重新创作";
-  const reviseButton = document.createElement("button");
-  reviseButton.type = "button";
-  reviseButton.className = "secondary";
-  reviseButton.textContent = isRefinement ? "根据新意见继续细化" : "按修改意见优化";
-  const cacheButton = document.createElement("button");
-  cacheButton.type = "button";
-  cacheButton.className = "secondary";
-  cacheButton.textContent = "输出缓存";
-  const clearButton = document.createElement("button");
-  clearButton.type = "button";
-  clearButton.className = "clear";
-  clearButton.textContent = "清空结果";
-  const status = document.createElement("div");
-  status.className = "status";
-  status.textContent = "仅执行当前节点，不触发工作流其他生成节点。";
-  const actions = document.createElement("div");
-  actions.className = "actions";
-  actions.append(button, reviseButton, cacheButton);
-  root.append(status, actions, clearButton);
+  const nativeWidgets = [];
+  const keepRuntimeOnly = (widget) => {
+    if (!widget) return widget;
+    // ComfyUI serializes widgets positionally. Passing serialize:false only in
+    // addWidget options is not honoured by every frontend release, so mark the
+    // widget itself as runtime-only as well. Otherwise these helper controls
+    // shift saved values into backend inputs such as 修改意见.
+    widget.serialize = false;
+    widget.options ||= {};
+    widget.options.serialize = false;
+    return widget;
+  };
+  const operationLabels = { rewrite: "重写时间轴", append: "续写时间轴" };
+  const operationFromLabel = (value) => value === operationLabels.append ? "append" : "rewrite";
+  let operationSelect = null;
+  let targetSelect = null;
+  const targetIdsByLabel = new Map();
+  if (isVideo) {
+    operationSelect = keepRuntimeOnly(node.addWidget(
+      "combo", "时间轴处理方式",
+      operationLabels[String(node.properties?.aipm_timeline_operation || "rewrite")] || operationLabels.rewrite,
+      (value) => {
+        node.properties.aipm_timeline_operation = operationFromLabel(value);
+        app.graph?.change?.();
+      },
+      { values: Object.values(operationLabels), serialize: false },
+    ));
+    targetSelect = keepRuntimeOnly(node.addWidget(
+      "combo", "修改目标分段", "暂无缓存",
+      (value) => {
+        node.properties.aipm_target_segment_id = targetIdsByLabel.get(String(value)) || "";
+        app.graph?.change?.();
+      },
+      { values: ["暂无缓存"], serialize: false },
+    ));
+    nativeWidgets.push(operationSelect, targetSelect);
+  }
+  let run = async () => {};
+  const button = keepRuntimeOnly(node.addWidget("button", isRefinement ? "分析并细化" : "生成 / 重新创作", null, () => run(false), { serialize: false }));
+  const reviseButton = keepRuntimeOnly(node.addWidget("button", isRefinement ? "根据新意见继续细化" : "按修改意见优化", null, () => run(true), { serialize: false }));
+  const cacheButton = keepRuntimeOnly(node.addWidget("button", "输出缓存", null, () => {}, { serialize: false }));
+  const clearButton = keepRuntimeOnly(node.addWidget("button", "清空结果", null, () => {}, { serialize: false }));
+  const status = keepRuntimeOnly(node.addWidget("text", "AIPM 状态", "仅执行当前节点，不触发工作流其他生成节点。", () => {}, { serialize: false }));
+  const videoPromptPreview = isVideo && keepRuntimeOnly(node.addWidget(
+    "text", "视频提示词预览", "", () => {},
+    { multiline: true, serialize: false },
+  ));
+  if (isVideo && modificationInput && operationSelect && targetSelect) {
+    // These controls are runtime-only and explicitly excluded from
+    // serialization. Reorder only their visual slots so the timeline choices
+    // remain adjacent to, and immediately above, the modification request.
+    const controls = [operationSelect, targetSelect];
+    node.widgets = (node.widgets || []).filter((widget) => !controls.includes(widget));
+    const modificationIndex = Math.max(node.widgets.indexOf(modificationInput), 0);
+    node.widgets.splice(modificationIndex, 0, ...controls);
+  }
+  status.options ||= {};
+  status.options.disabled = true;
+  nativeWidgets.push(button, reviseButton, cacheButton, clearButton, status);
+  if (videoPromptPreview) nativeWidgets.push(videoPromptPreview);
+  // Clear stale absolute layout coordinates after restoring/reordering widgets.
+  for (const widget of node.widgets || []) {
+    delete widget.y;
+    delete widget.last_y;
+  }
+  node.setDirtyCanvas?.(true, true);
 
   const setStatus = (message, type = "") => {
-    status.textContent = message;
-    status.className = `status ${type}`;
+    status.value = message;
     app.graph?.setDirtyCanvas(true, true);
+  };
+
+  const describeSubmissionError = (error) => {
+    if (!error) return "未知错误";
+    try {
+      const detailed = typeof error.toString === "function" ? String(error.toString()) : "";
+      if (detailed && detailed !== "[object Object]" && detailed !== String(error.message || "")) return detailed;
+      const response = error.response;
+      const serverError = response?.error;
+      const nodeErrors = response?.node_errors;
+      const parts = [];
+      if (typeof serverError === "string") parts.push(serverError);
+      else if (serverError) parts.push([serverError.message, serverError.details].filter(Boolean).join(": "));
+      if (nodeErrors && Object.keys(nodeErrors).length) parts.push(JSON.stringify(nodeErrors));
+      return parts.filter(Boolean).join(" | ") || String(error.message || error);
+    } catch (_) {
+      return String(error?.message || error);
+    }
   };
 
   const cachedAuthoring = () => {
     try {
       const value = JSON.parse(String(node.properties?.aipm_previous_result || ""));
-      return value?.schema === "cine_timeline" ? value?.metadata?.aipm : value;
+      return ["cine_timeline", "cine_keyframe_timeline"].includes(value?.schema) ? value?.metadata?.aipm : value;
     } catch (_) {
       return null;
     }
+  };
+
+  const refreshSegmentTargets = () => {
+    if (!isVideo) return;
+    const segments = cachedAuthoring()?.segments || [];
+    const wanted = String(node.properties?.aipm_target_segment_id || "");
+    targetIdsByLabel.clear();
+    const labels = segments.map((segment, index) => {
+      const id = String(segment?.segment_id || `SEGMENT_${String(index + 1).padStart(3, "0")}`);
+      const label = `${id} · ${String(segment?.title || `分段 ${index + 1}`)}`;
+      targetIdsByLabel.set(label, id);
+      return label;
+    });
+    targetSelect.options.values = labels.length ? labels : ["暂无缓存"];
+    const selectedLabel = labels.find((label) => targetIdsByLabel.get(label) === wanted) || labels[0] || "暂无缓存";
+    targetSelect.value = selectedLabel;
+    node.properties.aipm_target_segment_id = targetIdsByLabel.get(selectedLabel) || "";
   };
 
   const hasInterruptedVideo = () =>
@@ -350,19 +647,25 @@ function installGeneratePanel(node) {
 
   const updateRevisionAvailability = () => {
     const hasCache = Boolean(String(node.properties?.aipm_previous_result || "").trim());
-    reviseButton.disabled = running || !hasCache;
-    cacheButton.disabled = running || !hasCache;
-    if (!running && hasInterruptedVideo()) button.textContent = "继续生成";
+    // Native canvas widgets do not reliably repaint when `disabled` changes
+    // after workflow cache restoration. Keep actions physically clickable and
+    // let their callbacks explain missing prerequisites in the status widget.
+    reviseButton.disabled = false;
+    cacheButton.disabled = false;
+    if (!running && hasInterruptedVideo()) button.name = "继续生成";
+    refreshSegmentTargets();
   };
 
   const queueCurrentOutputs = async () => {
     // Queue direct text-preview consumers as execution endpoints. This keeps
     // prompt assistants independent from the expensive generation chain.
+    const activeGraph = node.graph || app.graph || app.rootGraph;
+    if (!activeGraph) throw new Error("找不到AIPM节点所属工作流图");
     const previewNodeIds = new Set();
     for (const output of node.outputs || []) {
       for (const linkId of output?.links || []) {
-        const link = app.graph?.links?.[linkId];
-        const target = link ? app.graph?.getNodeById?.(link.target_id) : null;
+        const link = activeGraph.links?.[linkId];
+        const target = link ? activeGraph.getNodeById?.(link.target_id) : null;
         const type = String(target?.type || target?.comfyClass || "").toLowerCase();
         if (type.includes("showtext") || type.includes("displaytext") || type.includes("previewtext")) {
           previewNodeIds.add(String(target.id));
@@ -370,11 +673,59 @@ function installGeneratePanel(node) {
       }
     }
     const executionTargets = previewNodeIds.size ? [...previewNodeIds] : [String(node.id)];
-    await app.queuePrompt(0, 1, executionTargets);
+    if (typeof app.graphToPrompt !== "function" || typeof app.api?.queuePrompt !== "function") {
+      throw new Error("当前 ComfyUI 不支持局部执行接口");
+    }
+    // Workflows can restore a node created under an older definition where
+    // the frontend constructor lost the backend output_node flag. Without it
+    // graphToPrompt serializes an empty prompt even though AIPM is an
+    // independently executable OUTPUT_NODE on the server.
+    node.constructor.nodeData ||= {};
+    node.constructor.nodeData.output_node = true;
+    node.mode = 0;
+    const prompt = await app.graphToPrompt(activeGraph);
+    const apiNodes = prompt?.output || {};
+    let targetIds = executionTargets.filter((id) => apiNodes[String(id)]).map(String);
+    if (!targetIds.length) {
+      const comfyClass = String(node.comfyClass || node.type || "");
+      const title = String(node.title || "");
+      const candidates = Object.entries(apiNodes).filter(([, value]) =>
+        String(value?.class_type || "") === comfyClass
+      );
+      const titled = candidates.filter(([, value]) => String(value?._meta?.title || "") === title);
+      const scoped = (titled.length ? titled : candidates).filter(([id]) =>
+        String(id) === String(node.id) || String(id).endsWith(`:${node.id}`)
+      );
+      const resolved = scoped.length ? scoped : (titled.length ? titled : candidates);
+      if (resolved.length === 1) targetIds = [String(resolved[0][0])];
+    }
+    if (!targetIds.length) {
+      throw new Error(`当前工作流图没有序列化AIPM执行节点 ${node.id}`);
+    }
+    // Build a self-contained prompt containing only the requested endpoint(s)
+    // and their upstream dependencies. This avoids ComfyUI 0.34's partial
+    // target filter occasionally reducing multi-workflow graphs to no outputs.
+    const keep = new Set();
+    const pending = [...targetIds.map(String)];
+    while (pending.length) {
+      const id = pending.pop();
+      if (keep.has(id) || !apiNodes[id]) continue;
+      keep.add(id);
+      for (const value of Object.values(apiNodes[id].inputs || {})) {
+        if (Array.isArray(value) && value.length === 2 && apiNodes[String(value[0])]) {
+          pending.push(String(value[0]));
+        }
+      }
+    }
+    prompt.output = Object.fromEntries(Object.entries(apiNodes).filter(([id]) => keep.has(String(id))));
+    await app.api.queuePrompt(0, prompt);
   };
 
-  const run = async (revise = false) => {
-    if (running) return;
+  run = async (revise = false) => {
+    if (running) {
+      setStatus("当前AIPM请求仍在执行，请等待完成；无需重复点击。", "");
+      return;
+    }
     const idea = node.widgets?.find((widget) =>
       widget.name === "画面描述与创作要求" || widget.name === "视频内容与导演要求" || widget.name === "原始提示词"
     );
@@ -394,9 +745,26 @@ function installGeneratePanel(node) {
       setStatus("还没有上次结果，请先生成一次提示词。", "error");
       return;
     }
+    if (isVideo && !revise && operationFromLabel(operationSelect.value) === "append" && !String(node.properties?.aipm_previous_result || "").trim()) {
+      setStatus("续写需要已有AIPM缓存，请先生成初始时间轴。", "error");
+      return;
+    }
+    if (isVideo && revise && !String(targetIdsByLabel.get(String(targetSelect.value)) || "").trim()) {
+      setStatus("请选择要修改的分段。", "error");
+      return;
+    }
     running = true;
-    currentAction = revise ? "revise" : (hasInterruptedVideo() ? "resume" : "generate");
-    if (revise && modification) {
+    currentAction = revise ? "revise" : (hasInterruptedVideo() ? "resume" : (
+      isVideo && operationFromLabel(operationSelect.value) === "append" ? "append" : "generate"
+    ));
+    if (isVideo && modification) {
+      modification.value = "__AIPM_RUN_V2__" + JSON.stringify({
+        operation: revise ? "revise_segment" : operationFromLabel(operationSelect.value),
+        target_segment_id: revise ? (targetIdsByLabel.get(String(targetSelect.value)) || "") : "",
+        instruction: originalModification,
+        previous_result: String(node.properties?.aipm_previous_result || ""),
+      });
+    } else if (revise && modification) {
       modification.value = REVISION_MARKER + JSON.stringify({
         instruction: originalModification,
         previous_result: String(node.properties?.aipm_previous_result || ""),
@@ -412,16 +780,11 @@ function installGeneratePanel(node) {
     if (referenceManifest) {
       referenceManifest.value = JSON.stringify(collectReferenceAssetManifest(node));
     }
-    button.disabled = true;
-    reviseButton.disabled = true;
-    cacheButton.disabled = true;
-    clearButton.disabled = true;
     setStatus(revise
       ? "正在保留未修改内容并定向优化……"
       : currentAction === "resume"
         ? "正在从上次失败分段继续生成……"
         : "正在分析输入并生成专业提示词……");
-    const previousMode = node.mode;
     node.mode = 0;
     if (previousResult && !node.widgets?.includes(previousResult)) {
       node.widgets.splice(Math.min(previousResultIndex, node.widgets.length), 0, previousResult);
@@ -434,21 +797,24 @@ function installGeneratePanel(node) {
       reviseButton.disabled = false;
       cacheButton.disabled = false;
       clearButton.disabled = false;
-      button.textContent = isRefinement ? "分析并细化" : "生成 / 重新创作";
-      reviseButton.textContent = isRefinement ? "根据新意见继续细化" : "按修改意见优化";
+      button.name = isRefinement ? "分析并细化" : "生成 / 重新创作";
+      reviseButton.name = isRefinement ? "根据新意见继续细化" : "按修改意见优化";
       updateRevisionAvailability();
-      setStatus(`提交失败：${error?.message || error}`, "error");
+      setStatus(`提交失败：${describeSubmissionError(error)}`, "error");
     } finally {
       // The revision field is user-authored working text. Keep it after every
       // submission so the user can refine or reuse the same instruction.
       if (modification) modification.value = originalModification;
-      node.mode = previousMode;
+      node.mode = 0;
     }
   };
-  button.onclick = () => run(false);
-  reviseButton.onclick = () => run(true);
-  cacheButton.onclick = async () => {
-    if (running) return;
+  button.callback = () => run(false);
+  reviseButton.callback = () => run(true);
+  cacheButton.callback = async () => {
+    if (running) {
+      setStatus("当前AIPM请求仍在执行，请等待完成；无需重复点击。", "");
+      return;
+    }
     const cached = String(node.properties?.aipm_previous_result || "").trim();
     if (!cached) {
       setStatus("还没有可输出的缓存，请先生成一次提示词。", "error");
@@ -466,12 +832,7 @@ function installGeneratePanel(node) {
     // Refinement nodes can keep their issue text because their cached branch
     // is selected whenever no independent execution marker is present.
     if (modification && !isRefinement) modification.value = "";
-    button.disabled = true;
-    reviseButton.disabled = true;
-    cacheButton.disabled = true;
-    clearButton.disabled = true;
     setStatus("正在从本地缓存重新输出，不调用远程服务……");
-    const previousMode = node.mode;
     node.mode = 0;
     if (previousResult && !node.widgets?.includes(previousResult)) {
       node.widgets.splice(Math.min(previousResultIndex, node.widgets.length), 0, previousResult);
@@ -485,14 +846,17 @@ function installGeneratePanel(node) {
       cacheButton.disabled = false;
       clearButton.disabled = false;
       updateRevisionAvailability();
-      setStatus(`缓存输出失败：${error?.message || error}`, "error");
+      setStatus(`缓存输出失败：${describeSubmissionError(error)}`, "error");
     } finally {
       if (modification) modification.value = originalModification;
-      node.mode = previousMode;
+      node.mode = 0;
     }
   };
-  clearButton.onclick = () => {
-    if (running) return;
+  clearButton.callback = () => {
+    if (running) {
+      setStatus("当前AIPM请求仍在执行，完成后才能清空结果。", "");
+      return;
+    }
     const modification = node.widgets?.find((widget) =>
       widget.name === "修改意见" || widget.name === "遇到的问题与修改目标"
     );
@@ -505,6 +869,11 @@ function installGeneratePanel(node) {
   };
 
   const acceptResult = (output) => {
+    if (videoPromptPreview && output?.text?.[0] != null) {
+      videoPromptPreview.value = String(output.text[0]);
+      node.setDirtyCanvas?.(true, true);
+    }
+    writeTextToLinkedPreviews(node, output);
     const raw = output?.text?.[2];
     let authoring = null;
     if (raw) {
@@ -513,7 +882,16 @@ function installGeneratePanel(node) {
       if (previousResult) previousResult.value = String(raw);
       authoring = cachedAuthoring();
       if (authoring?.generation_status !== "interrupted") {
-        writeResultToLinkedCineTimelines(node, raw);
+        const resultOperation = String(authoring?.aipm_operation || "");
+        const writeStrategy = currentAction === "revise" || resultOperation === "revise_segment"
+          ? "revise_segment"
+          : currentAction === "append" || resultOperation === "append"
+            ? "append"
+            : "rewrite";
+        writeResultToLinkedCineTimelines(
+          node, raw, writeStrategy,
+          String(node.properties?.aipm_target_segment_id || ""),
+        );
       }
     }
     app.graph?.change?.();
@@ -524,10 +902,10 @@ function installGeneratePanel(node) {
     reviseButton.disabled = false;
     cacheButton.disabled = false;
     clearButton.disabled = false;
-    button.textContent = isRefinement
+    button.name = isRefinement
       ? "分析并细化"
       : authoring?.generation_status === "interrupted" ? "继续生成" : "生成 / 重新创作";
-    reviseButton.textContent = isRefinement ? "根据新意见继续细化" : "按修改意见优化";
+    reviseButton.name = isRefinement ? "根据新意见继续细化" : "按修改意见优化";
     if (authoring?.generation_status === "interrupted") {
       const next = Number(authoring?.resume_from_segment || 1);
       setStatus(`第 ${next} 段连续失败 2 次，已保留前面完成的分段；再次点击“继续生成”将从本段继续。`, "error");
@@ -537,6 +915,8 @@ function installGeneratePanel(node) {
         ? "提示词优化完成，已保存为新的有效版本。"
         : currentAction === "resume"
           ? "剩余分段生成完成，已保存完整结果。"
+          : currentAction === "append"
+            ? "续写分段已追加到AIPM缓存与已连接时间轴。"
           : "提示词生成完成，已保存为上次有效结果。", "ok");
   };
   const executed = ({ detail }) => {
@@ -551,13 +931,25 @@ function installGeneratePanel(node) {
     reviseButton.disabled = false;
     cacheButton.disabled = false;
     clearButton.disabled = false;
-    button.textContent = isRefinement ? "分析并细化" : "生成 / 重新创作";
-    reviseButton.textContent = isRefinement ? "根据新意见继续细化" : "按修改意见优化";
+    button.name = isRefinement ? "分析并细化" : "生成 / 重新创作";
+    reviseButton.name = isRefinement ? "根据新意见继续细化" : "按修改意见优化";
     updateRevisionAvailability();
     setStatus(`生成失败：${detail?.exception_message || detail?.message || "请查看执行错误"}`, "error");
   };
+  const completedWithoutNodeResult = () => {
+    setTimeout(() => {
+      if (!running) return;
+      running = false;
+      button.disabled = false;
+      clearButton.disabled = false;
+      updateRevisionAvailability();
+      setStatus("本次队列已经结束，但没有收到新的AIPM结果；按钮已自动恢复，请检查任务队列或再次提交。", "error");
+    }, 0);
+  };
   api.addEventListener("executed", executed);
   api.addEventListener("execution_error", failed);
+  api.addEventListener("execution_success", completedWithoutNodeResult);
+  api.addEventListener("execution_interrupted", completedWithoutNodeResult);
 
   const originalNodeExecuted = node.onExecuted;
   const nodeExecuted = function (output) {
@@ -575,27 +967,74 @@ function installGeneratePanel(node) {
   };
   node.onSerialize = serialize;
 
-  const widget = node.addDOMWidget("aipm_generate", "AIPMGenerate", root, {
-    serialize: false,
-    hideOnZoom: false,
-    getMinHeight: () => 108,
-  });
-  widget.computeSize = (width) => [width, 112];
   updateRevisionAvailability();
   const cleanup = () => {
     api.removeEventListener("executed", executed);
     api.removeEventListener("execution_error", failed);
+    api.removeEventListener("execution_success", completedWithoutNodeResult);
+    api.removeEventListener("execution_interrupted", completedWithoutNodeResult);
     if (node.onExecuted === nodeExecuted) node.onExecuted = originalNodeExecuted;
     if (node.onSerialize === serialize) node.onSerialize = originalSerialize;
   };
-  node._aipmGeneratePanel = { version: VERSION, root, widget, cleanup };
-  requestAnimationFrame(() => syncGeneratePanelWidth(node));
+  let panelRoot = null;
+  let panelWidget = null;
+  if (isImage) {
+    // Canvas-native button hit testing can be lost in large workflows with
+    // overlapping groups/DOM widgets. Use real DOM buttons for image prompt
+    // actions while preserving the same callbacks and status widget.
+    for (const actionWidget of [button, reviseButton, cacheButton, clearButton]) {
+      actionWidget.hidden = true;
+      actionWidget.computeSize = () => [0, -4];
+    }
+    panelRoot = document.createElement("div");
+    panelRoot.className = "aipm-image-actions-v76";
+    Object.assign(panelRoot.style, {
+      display: "grid", gridTemplateColumns: "1fr", gridAutoRows: "20px",
+      alignContent: "start", gap: "2px", boxSizing: "border-box",
+      width: "100%", height: "86px", maxHeight: "86px", padding: "0",
+      pointerEvents: "auto", overflow: "hidden",
+    });
+    const actions = [
+      ["生成 / 重新创作", () => run(false)],
+      ["按修改意见优化", () => run(true)],
+      ["输出缓存", () => cacheButton.callback?.()],
+      ["清空结果", () => clearButton.callback?.()],
+    ];
+    for (const [label, action] of actions) {
+      const domButton = document.createElement("button");
+      domButton.type = "button";
+      domButton.textContent = label;
+      Object.assign(domButton.style, {
+        width: "100%", height: "20px", minHeight: "20px", padding: "0 6px",
+        font: "inherit", lineHeight: "18px", border: "1px solid #555",
+        borderRadius: "3px", background: "#252525", color: "#ddd",
+        cursor: "pointer", pointerEvents: "auto",
+      });
+      domButton.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        action();
+      });
+      panelRoot.append(domButton);
+    }
+    panelWidget = node.addDOMWidget?.("aipm_image_actions", "AIPMImageActions", panelRoot, {
+      serialize: false, hideOnZoom: false, getMinHeight: () => 86,
+    }) || null;
+    if (panelWidget) {
+      panelWidget.computeSize = (width) => [width, 86];
+      keepRuntimeOnly(panelWidget);
+    }
+  }
+  node._aipmGeneratePanel = {
+    version: VERSION, root: panelRoot, widget: panelWidget, nativeWidgets, cleanup,
+  };
   const originalRemoved = node.onRemoved;
   node.onRemoved = function () {
     cleanup();
     return originalRemoved?.apply(this, arguments);
   };
   requestAnimationFrame(() => {
+    node._aipmFitContentInput?.();
     const currentWidth = Number(node.size?.[0]) || 430;
     const computedHeight = Number(node.computeSize?.([currentWidth, 0])?.[1]) || 0;
     const requiredHeight = Math.max(computedHeight, 300);
@@ -615,22 +1054,41 @@ app.registerExtension({
     const originalConfigure = nodeType.prototype.onConfigure;
     nodeType.prototype.onConfigure = function () {
       this._aipmLoadedFromWorkflow = true;
+      // Workflow values are restored positionally. Runtime-only controls may
+      // already have been added by onNodeCreated, so remove them before the
+      // core loader assigns widgets_values, then rebuild them afterwards.
+      removeOldPanel(this);
       const result = originalConfigure?.apply(this, arguments);
       migrateReferenceInputNames(this);
+      syncDynamicReferenceInputs(this);
       migrateModelNameWidget(this);
       migrateImageModelDefault(this);
+      migrateVideoTargetModel(this);
       migrateImageReferencePurpose(this);
+      migrateVideoGenerationMode(this);
       migrateShiftedCachedResult(this);
+      migrateVideoDurationWidget(this);
+      configureStableNodeLayout(this);
+      installGeneratePanel(this);
       return result;
     };
     const original = nodeType.prototype.onNodeCreated;
+    const originalConnectionsChange = nodeType.prototype.onConnectionsChange;
+    nodeType.prototype.onConnectionsChange = function () {
+      const result = originalConnectionsChange?.apply(this, arguments);
+      requestAnimationFrame(() => syncDynamicReferenceInputs(this));
+      return result;
+    };
     nodeType.prototype.onNodeCreated = function () {
       const result = original?.apply(this, arguments);
       requestAnimationFrame(() => {
         migrateReferenceInputNames(this);
+        syncDynamicReferenceInputs(this);
         migrateModelNameWidget(this);
         migrateImageModelDefault(this);
+        migrateVideoTargetModel(this);
         migrateImageReferencePurpose(this);
+        migrateVideoGenerationMode(this);
         migrateShiftedCachedResult(this);
         migrateVideoDurationWidget(this);
         configureStableNodeLayout(this);
@@ -640,3 +1098,5 @@ app.registerExtension({
     };
   },
 });
+
+}

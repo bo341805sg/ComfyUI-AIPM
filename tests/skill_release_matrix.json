@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated": "2026-08-23",
+  "updated": "2026-09-01",
   "release_gate": {
     "required_models": ["remote-primary", "remote-secondary", "local-fallback"],
     "compare": ["without_skill", "with_skill"],
@@ -22,6 +22,8 @@
     {"id": "h3_base_format", "skill": "aipm-minimax-h3-video", "capability": "Base fields timestamps dialogue and Chinese body remain valid"},
     {"id": "h3_ref2va_four_media", "skill": "aipm-minimax-h3-video", "capability": "reference labels roles retention and audio remain consistent"},
     {"id": "booru_family_isolation", "skill": "aipm-illustrious-booru", "capability": "NoobAI and Pony prefixes do not cross-contaminate"},
+    {"id": "anima_strict_full_body", "skill": "aipm-anima", "capability": "full-body requests keep the complete head-to-toe figure and reject competing close framing"},
+    {"id": "anima_hybrid_spatial_prompt", "skill": "aipm-anima", "capability": "complex Anima composition uses model-native tags plus explicit natural-language spatial constraints"},
     {"id": "refinement_minimal_repair", "skill": "aipm-prompt-refinement", "capability": "repair fixes named defect without changing protected content"}
   ],
   "runs": []

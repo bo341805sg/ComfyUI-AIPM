@@ -1,4 +1,5 @@
 import importlib.util
+import inspect
 import json
 import pathlib
 import unittest
@@ -55,8 +56,12 @@ class PromptAssistantTests(unittest.TestCase):
         self.assertIn('modification.computeSize = (width) => [width, 54]', ui)
         self.assertIn('element.style.resize = "none"', ui)
         self.assertIn("configureStableNodeLayout(this)", ui)
-        self.assertIn("grid-template-columns:repeat(3,minmax(0,1fr))", ui)
-        self.assertIn("box-sizing:border-box;min-width:0;width:100%", ui)
+        self.assertIn('node.addWidget("button"', ui)
+        self.assertIn('node.addWidget(\n      "combo", "时间轴处理方式"', ui)
+        self.assertIn('node.widgets.splice(modificationIndex, 0, ...controls)', ui)
+        self.assertIn("immediately above, the modification request", ui)
+        self.assertIn("delete widget.last_y", ui)
+        self.assertIn('node.addDOMWidget?.("aipm_image_actions"', ui)
         for node in (nodes.AIPMImagePrompt, nodes.AIPMVideoPromptCore):
             self.assertNotIn("独立执行令牌", node.INPUT_TYPES().get("optional", {}))
 
@@ -67,28 +72,76 @@ class PromptAssistantTests(unittest.TestCase):
         self.assertIn("node.onSerialize = serialize", ui)
         self.assertIn("previousResult.value = String(this.properties.aipm_previous_result)", ui)
 
+    def test_frontend_only_native_controls_never_enter_positional_widget_values(self):
+        ui = (ROOT / "web" / "aipm_ui.js").read_text(encoding="utf-8")
+        self.assertIn("const keepRuntimeOnly = (widget)", ui)
+        self.assertIn("widget.serialize = false", ui)
+        self.assertIn("widget.options.serialize = false", ui)
+        for name in ("operationSelect", "targetSelect", "button", "reviseButton", "cacheButton", "clearButton", "status"):
+            self.assertIn(f"keepRuntimeOnly(node.addWidget", ui)
+        self.assertIn("removeOldPanel(this);\n      const result = originalConfigure", ui)
+        self.assertIn("configureStableNodeLayout(this);\n      installGeneratePanel(this);", ui)
+        self.assertIn('["重写时间轴", "续写时间轴"].includes', ui)
+        self.assertIn("modificationInput.value = shiftedInstruction", ui)
+
     def test_video_result_is_immediately_written_to_linked_cinetimeline(self):
         ui = (ROOT / "web" / "aipm_ui.js").read_text(encoding="utf-8")
-        self.assertIn("function writeResultToLinkedCineTimelines(node, rawTimelineJson)", ui)
+        self.assertIn('function writeResultToLinkedCineTimelines(node, rawTimelineJson, strategy = "rewrite"', ui)
         self.assertIn('output?.name === "完整结果 JSON"', ui)
         self.assertIn('targetInput?.name !== "timeline_json"', ui)
         self.assertIn("timelineWidget.value = raw", ui)
         self.assertIn("target.cineTimelineEditor?.reloadState?.()", ui)
-        self.assertIn("writeResultToLinkedCineTimelines(node, raw)", ui)
+        self.assertIn("writeResultToLinkedCineTimelines(", ui)
+        self.assertIn('if (index === 0 || shot.metadata.new_scene === true) shot.transition = "cut"', ui)
+        self.assertIn('else if (!["cut", "motion_context"].includes(shot.transition))', ui)
+        self.assertIn('const resultOperation = String(authoring?.aipm_operation || "")', ui)
+        self.assertIn('next = { ...parsed, shots: incoming.map((shot) => {', ui)
+        self.assertIn('metadata: { ...(shot.metadata || {}), render: oldRender }', ui)
+        self.assertNotIn('current?.metadata?.render_target_shot_id', ui)
 
     def test_generate_buttons_keep_fixed_labels_and_width_while_running(self):
         ui = (ROOT / "web" / "aipm_ui.js").read_text(encoding="utf-8")
         self.assertNotIn('button.textContent = revise ? "生成 / 重新创作" : "正在生成……"', ui)
-        self.assertIn("overflow:hidden;text-overflow:ellipsis;white-space:nowrap", ui)
-        self.assertIn("function syncGeneratePanelWidth(node)", ui)
-        self.assertIn("panel.widget.computedWidth = width", ui)
-        self.assertIn("requestAnimationFrame(() => syncGeneratePanelWidth(this))", ui)
+        self.assertIn('button.name = isRefinement', ui)
+        self.assertIn('button.callback = () => run(false)', ui)
+        self.assertIn('document.createElement("button")', ui)
+        self.assertIn("当前AIPM请求仍在执行，请等待完成", ui)
+        self.assertIn("const activeGraph = node.graph || app.graph || app.rootGraph", ui)
+        self.assertIn("const prompt = await app.graphToPrompt(activeGraph)", ui)
+        self.assertIn("const keep = new Set()", ui)
+        self.assertIn("String(value?.class_type || \"\") === comfyClass", ui)
+        self.assertIn("String(id).endsWith(`:${node.id}`)", ui)
+        self.assertIn("prompt.output = Object.fromEntries", ui)
+        self.assertIn("node.constructor.nodeData.output_node = true", ui)
+        self.assertNotIn("partialExecutionTargets: executionTargets", ui)
+        self.assertNotIn("app.queuePrompt(0, 1, executionTargets)", ui)
+        self.assertIn('api.addEventListener("execution_success", completedWithoutNodeResult)', ui)
+        self.assertIn("reviseButton.disabled = false", ui)
+        self.assertIn("node.mode = 0", ui)
+
+    def test_legacy_cache_busting_entries_do_not_register_duplicate_extensions(self):
+        web = ROOT / "web"
+        legacy_entries = sorted(web.glob("aipm_ui_v*.js"))
+        for entry in legacy_entries:
+            source = entry.read_text(encoding="utf-8")
+            if entry.name in {"aipm_ui_v53.js", "aipm_ui_v54.js", "aipm_ui_v55.js", "aipm_ui_v56.js", "aipm_ui_v57.js", "aipm_ui_v58.js", "aipm_ui_v59.js", "aipm_ui_v60.js", "aipm_ui_v61.js", "aipm_ui_v62.js", "aipm_ui_v63.js", "aipm_ui_v64.js", "aipm_ui_v65.js", "aipm_ui_v66.js"}:
+                expected = entry.stem.rsplit("v", 1)[-1]
+                self.assertIn(f'import "./aipm_ui.js?v={expected}"', source)
+                continue
+            self.assertNotIn('import "./aipm_ui.js?', source, entry.name)
+            self.assertNotIn("app.registerExtension", source, entry.name)
+        ui = (web / "aipm_ui.js").read_text(encoding="utf-8")
+        self.assertIn("globalThis.__COMFYUI_AIPM_UI_VERSION__ < 76", ui)
+        self.assertIn('"CineTimelinePlan", "CineTimelineKeyframePlan"', ui)
+        self.assertIn("const link = activeGraph.links?.[linkId]", ui)
+        self.assertIn("writeTextToLinkedPreviews(node, output)", ui)
+        self.assertIn('"视频提示词预览"', ui)
 
     def test_all_prompt_nodes_have_offline_cached_output_button(self):
         ui = (ROOT / "web" / "aipm_ui.js").read_text(encoding="utf-8")
-        self.assertIn('cacheButton.textContent = "输出缓存"', ui)
-        self.assertIn("actions.append(button, reviseButton, cacheButton)", ui)
-        self.assertIn("grid-template-columns:repeat(3,minmax(0,1fr))", ui)
+        self.assertIn('node.addWidget("button", "输出缓存"', ui)
+        self.assertIn("cacheButton.callback = async () =>", ui)
+        self.assertIn('node.addDOMWidget?.("aipm_image_actions"', ui)
         self.assertIn('setStatus("正在从本地缓存重新输出，不调用远程服务……")', ui)
         self.assertIn('currentAction === "cache"', ui)
         self.assertIn('"AIPMImagePrompt", "AIPMVideoPrompt", "AIPMPromptRefinement"', ui)
@@ -105,6 +158,9 @@ class PromptAssistantTests(unittest.TestCase):
         self.assertIn("image1", optional)
         self.assertIn("image2", optional)
         self.assertIn("image3", optional)
+        self.assertEqual([name for name in optional if name.startswith("image")], [f"image{i}" for i in range(1, 10)])
+        for name in (f"image{i}" for i in range(1, 10)):
+            self.assertIn(name, inspect.signature(nodes.AIPMImagePrompt.generate).parameters)
         self.assertNotIn("参考图片", optional)
         self.assertNotIn("重新生成标记", optional)
         self.assertNotIn("修改模式", optional)
@@ -118,6 +174,8 @@ class PromptAssistantTests(unittest.TestCase):
         encoded_calls = []
 
         def fake_encode(value, limit=9):
+            if value is None:
+                return []
             encoded_calls.append((value, limit))
             return [{"sha256": str(value), "data_url": "data:image/jpeg;base64,AA=="}]
 
@@ -200,6 +258,7 @@ class PromptAssistantTests(unittest.TestCase):
         self.assertEqual(loaded["Krea 2 身份编辑"], "aipm-krea2-identity-edit")
         self.assertEqual(loaded["FLUX.2 多参考编辑"], "aipm-flux2-edit")
         self.assertEqual(loaded["Qwen Image 多图编辑"], "aipm-qwen-image-edit")
+        self.assertEqual(loaded["Anima 系列"], "aipm-anima")
         self.assertTrue(nodes.NATIVE_QUALITY_ANCHORS["Pony Diffusion / Pony 系模型"].startswith("score_9"))
         self.assertIn("masterpiece", nodes.NATIVE_QUALITY_ANCHORS["Illustrious / NoobAI 系模型"])
 
@@ -260,16 +319,57 @@ class PromptAssistantTests(unittest.TestCase):
         candidate["reference_usage"].append("<Picture 2> defines the man on the right")
         nodes.AIPMImagePrompt.validate_generated_result(candidate, "en", 2, "多参考改图")
 
+    def test_anima_full_body_requires_complete_non_competing_framing_contract(self):
+        weak = {
+            "positive_prompt": "masterpiece, best quality, 1girl, standing, full body, portrait",
+            "negative_prompt": "cropped",
+            "reference_usage": [],
+        }
+        with self.assertRaisesRegex(nodes.PromptAssistantError, "Anima 全身构图契约不完整"):
+            nodes.AIPMImagePrompt.validate_generated_result(
+                weak, "en-tags", 0, "无参考图", "纯色背景全身图", "Anima 系列",
+            )
+        strong = {
+            "positive_prompt": (
+                "masterpiece, best quality, highres, safe, 1girl, solo, (full body:1.2), "
+                "head-to-toe, entire figure visible, both feet visible, long shot, standing on the ground. "
+                "A full-length character illustration with clear space above her head and below both feet; "
+                "her complete body remains inside the frame without any crop."
+            ),
+            "negative_prompt": (
+                "cropped, accidental crop, cropped feet, feet out of frame, lower body out of frame, "
+                "upper body, close-up"
+            ),
+            "reference_usage": [],
+        }
+        nodes.AIPMImagePrompt.validate_generated_result(
+            strong, "en-tags", 0, "无参考图", "纯色背景全身图", "Anima 系列",
+        )
+
+    def test_anima_rejects_more_than_three_weighted_concepts(self):
+        candidate = {
+            "positive_prompt": "1girl, (full body:1.2), (red dress:1.1), (blue eyes:1.1), (smile:1.1)",
+            "negative_prompt": "cropped",
+            "reference_usage": [],
+        }
+        with self.assertRaisesRegex(nodes.PromptAssistantError, "最多只能加权 3 个"):
+            nodes.AIPMImagePrompt.validate_generated_result(
+                candidate, "en-tags", 0, "无参考图", "一个女孩", "Anima 系列",
+            )
+
     def test_official_prompt_family_rules_are_preserved(self):
         _, flux = nodes.load_prompt_skill("FLUX.1 / FLUX.2 系列")
         _, qwen = nodes.load_prompt_skill("Qwen Image 系列")
         _, krea = nodes.load_prompt_skill("Krea 2 / Krea 2 Turbo 系列")
         _, noobai = nodes.load_prompt_skill("Illustrious / NoobAI 系模型")
+        _, anima = nodes.load_prompt_skill("Anima 系列")
         self.assertIn("清晰自然语言", flux)
         self.assertIn("英文双引号", flux)
         self.assertIn("年龄段、脸型与骨相", qwen)
         self.assertIn("内容、主体和构图", krea)
         self.assertIn("NoobAI XL 1.1 官方模型卡", noobai)
+        self.assertIn("Anima 是独立的动漫/插画模型家族", anima)
+        self.assertIn("both feet visible", anima)
         self.assertNotIn("Stable Diffusion 1.x", nodes.NATIVE_QUALITY_ANCHORS)
         self.assertNotIn("Stable Diffusion XL 基础模型", nodes.NATIVE_QUALITY_ANCHORS)
 
@@ -291,7 +391,9 @@ class PromptAssistantTests(unittest.TestCase):
         nodes.AIPMVideoPromptCore.validate_h3_structure(base, "text_to_video", 8)
         with self.assertRaises(nodes.PromptAssistantError):
             nodes.AIPMVideoPromptCore.validate_h3_structure(base, "h3_ref2va", 8)
-        invalid_time = base.replace("[Shot 1]", "[Shot 1] [Shot 2] At 00:08.000,")
+        boundary_time = base.replace("[Shot 1]", "[Shot 1] [Shot 2] At 00:08.000,")
+        nodes.AIPMVideoPromptCore.validate_h3_structure(boundary_time, "text_to_video", 8)
+        invalid_time = base.replace("[Shot 1]", "[Shot 1] [Shot 2] At 00:08.001,")
         with self.assertRaises(nodes.PromptAssistantError):
             nodes.AIPMVideoPromptCore.validate_h3_structure(invalid_time, "text_to_video", 8)
 
@@ -415,22 +517,72 @@ class PromptAssistantTests(unittest.TestCase):
 
     def test_video_node_exposes_minimax_h3_and_media_inputs(self):
         inputs = nodes.AIPMVideoPromptCore.INPUT_TYPES()
-        self.assertIn("MiniMax H3（自动判断模式）", inputs["required"]["目标视频模型"][0])
+        self.assertEqual(inputs["required"]["目标视频模型"][0], ["MiniMax H3"])
         self.assertEqual(inputs["required"]["视频时长"][0], "INT")
+        self.assertEqual(inputs["required"]["视频时长"][1]["default"], 15)
         self.assertEqual(inputs["required"]["视频时长"][1]["min"], 4)
-        self.assertEqual(inputs["required"]["视频时长"][1]["max"], 15)
+        self.assertEqual(inputs["required"]["视频时长"][1]["max"], 30)
         self.assertEqual(inputs["required"]["分段数量"][0], "INT")
         self.assertEqual(inputs["required"]["分段数量"][1]["default"], 1)
         self.assertIn("image1", inputs["optional"])
         self.assertIn("image4", inputs["optional"])
         self.assertIn("video1", inputs["optional"])
         self.assertIn("audio1", inputs["optional"])
+        self.assertEqual([name for name in inputs["optional"] if name.startswith("image")], [f"image{i}" for i in range(1, 10)])
+        self.assertEqual([name for name in inputs["optional"] if name.startswith("video")], [f"video{i}" for i in range(1, 4)])
+        self.assertEqual([name for name in inputs["optional"] if name.startswith("audio")], [f"audio{i}" for i in range(1, 4)])
+        signature = inspect.signature(nodes.AIPMVideoPromptCore.generate).parameters
+        for name in [*(f"image{i}" for i in range(1, 10)), *(f"video{i}" for i in range(1, 4)), *(f"audio{i}" for i in range(1, 4))]:
+            self.assertIn(name, signature)
+
+    def test_reference_ports_use_one_dynamic_trailing_placeholder(self):
+        ui = (ROOT / "web" / "aipm_ui.js").read_text(encoding="utf-8")
+        self.assertIn("function syncDynamicReferenceInputs(node)", ui)
+        self.assertIn('return { image: 9, video: 3, audio: 3 }', ui)
+        self.assertIn("input.link != null", ui)
+        self.assertIn("number !== availableNumber", ui)
+        self.assertIn("node.removeInput?.(slot)", ui)
+        self.assertIn("node.addInput?.(`${prefix}${availableNumber}`, type)", ui)
+        self.assertIn("nodeType.prototype.onConnectionsChange", ui)
+
+    def test_image_node_does_not_install_video_preview_widget(self):
+        ui = (ROOT / "web" / "aipm_ui.js").read_text(encoding="utf-8")
+        self.assertIn("const videoPromptPreview = isVideo &&", ui)
+        self.assertIn("if (videoPromptPreview) nativeWidgets.push(videoPromptPreview)", ui)
+        self.assertIn("const VERSION = 76", ui)
+        self.assertIn('panelRoot.className = "aipm-image-actions-v76"', ui)
+        self.assertIn('gridAutoRows: "20px"', ui)
+        self.assertIn('alignContent: "start"', ui)
+        self.assertIn("const resizeContentInput = (nextHeight) =>", ui)
+        self.assertIn("contentInput._aipmAdaptiveHeight = adaptiveHeight", ui)
+        self.assertIn("resizeContentInput(Number(nextSize[1]))", ui)
+        self.assertIn("node._aipmFitContentInput = () =>", ui)
+        self.assertIn("contentInput._aipmAdaptiveHeight + targetHeight - naturalHeight", ui)
+        self.assertIn("panelWidget.computeSize = (width) => [width, 86]", ui)
+        self.assertIn("contentInput._aipmAdaptiveHeight = 72", ui)
+        self.assertIn("targetHeight - naturalHeight - 8", ui)
+        self.assertIn('"正向提示词": textValues[0]', ui)
+        self.assertIn('String(targetInput?.type || "").toUpperCase() !== "STRING"', ui)
+        self.assertIn("targetWidget.value = String(value)", ui)
+        self.assertIn('height: "20px", minHeight: "20px"', ui)
+        self.assertIn("getMinHeight: () => 86", ui)
+        self.assertIn('["自动判断 / 通用（推荐）", "Krea 2 / Krea 2 Turbo 系列"]', ui)
+        self.assertIn('widget.value = "Krea 2 / Krea 2 Turbo 文生图"', ui)
+        self.assertIn('node.addDOMWidget?.("aipm_image_actions"', ui)
+        self.assertIn('["生成 / 重新创作", () => run(false)]', ui)
 
     def test_video_mode_resolution(self):
         resolve = nodes.AIPMVideoPromptCore._resolve_mode
-        self.assertEqual(resolve("MiniMax H3（自动判断模式）", "自动判断（推荐）", 0, False, False), "text_to_video")
+        self.assertEqual(resolve("MiniMax H3（自动判断模式）", "自动判断", 0, False, False), "h3_ref2va")
+        self.assertEqual(resolve("MiniMax H3（自动判断模式）", "自动判断", 1, False, False), "h3_ref2va")
+        self.assertEqual(resolve("MiniMax H3（自动判断模式）", "自动判断", 2, False, False), "h3_ref2va")
+        self.assertEqual(resolve("MiniMax H3（自动判断模式）", "自动判断", 3, False, False), "h3_ref2va")
+        self.assertEqual(resolve("MiniMax H3（自动判断模式）", "自动判断", 1, True, False), "h3_ref2va")
+        self.assertEqual(resolve("MiniMax H3（自动判断模式）", "关键帧", 3, False, False), "h3_keyframe")
+        self.assertEqual(resolve("MiniMax H3（自动判断模式）", "多模态", 1, True, True), "h3_ref2va")
+        self.assertEqual(resolve("MiniMax H3（自动判断模式）", "自动判断（推荐）", 0, False, False), "h3_ref2va")
         self.assertEqual(resolve("MiniMax H3（自动判断模式）", "自动判断（推荐）", 1, False, False), "h3_ref2va")
-        self.assertEqual(resolve("MiniMax H3 FL2VA（首尾帧）", "自动判断（推荐）", 2, False, False), "h3_fl2va")
+        self.assertEqual(resolve("MiniMax H3 FL2VA（首尾帧）", "自动判断（推荐）", 2, False, False), "h3_ref2va")
         self.assertEqual(resolve("MiniMax H3（自动判断模式）", "首帧 I2VA", 1, False, False), "h3_i2va")
         self.assertEqual(resolve("MiniMax H3（自动判断模式）", "尾帧 L2VA", 1, False, False), "h3_l2va")
 
@@ -439,8 +591,8 @@ class PromptAssistantTests(unittest.TestCase):
         self.assertEqual(nodes.load_prompt_skill("LTX-Video 系列")[0], "aipm-ltx-video")
         self.assertEqual(nodes.load_prompt_skill("HunyuanVideo 系列")[0], "aipm-hunyuan-video")
         modes = nodes.AIPMVideoPromptCore.INPUT_TYPES()["required"]["生成模式"][0]
-        self.assertIn("首帧 I2VA", modes)
-        self.assertIn("尾帧 L2VA", modes)
+        self.assertEqual(modes, ["多模态", "关键帧"])
+        self.assertEqual(nodes.AIPMVideoPromptCore.INPUT_TYPES()["required"]["生成模式"][1]["default"], "多模态")
 
     def test_timeline_plan_schema_requires_exact_segment_count(self):
         schema = nodes.AIPMVideoPromptCore.timeline_plan_format(3)["json_schema"]["schema"]
@@ -448,6 +600,8 @@ class PromptAssistantTests(unittest.TestCase):
         self.assertEqual(segments["minItems"], 3)
         self.assertEqual(segments["maxItems"], 3)
         self.assertIn("dialogue_lines", segments["items"]["required"])
+        self.assertIn("transition", segments["items"]["required"])
+        self.assertEqual(segments["items"]["properties"]["transition"]["enum"], ["cut", "motion_context"])
 
     def test_dialogue_speaker_ids_are_bound_locally(self):
         prompt = "母亲说道：<d>[Chinese] 到了给妈打电话。</d> 女儿回答：<d>[Chinese] 知道了，妈。</d>"
@@ -456,6 +610,26 @@ class PromptAssistantTests(unittest.TestCase):
         )
         self.assertIn("(S1) <d>[Chinese] 到了给妈打电话。</d>", bound)
         self.assertIn("(S2) <d>[Chinese] 知道了，妈。</d>", bound)
+
+    def test_dialogue_speaker_binding_does_not_duplicate_existing_clause_id(self):
+        prompt = "母亲 (S1) 以温和的声音说道：<d>[Chinese] 到了给妈打电话。</d>"
+        bound = nodes.AIPMVideoPromptCore.bind_dialogue_speaker_ids(
+            prompt, ["母亲：到了给妈打电话。"],
+        )
+        self.assertEqual(bound.count("(S1)"), 1)
+        self.assertEqual(
+            nodes.AIPMVideoPromptCore.bind_dialogue_speaker_ids(
+                bound, ["母亲：到了给妈打电话。"],
+            ),
+            bound,
+        )
+
+    def test_dialogue_speaker_binding_removes_duplicate_same_id_in_clause(self):
+        prompt = "母亲 (S1) 低声说道：(S1) <d>[Chinese] 到了给妈打电话。</d>"
+        bound = nodes.AIPMVideoPromptCore.bind_dialogue_speaker_ids(
+            prompt, ["母亲：到了给妈打电话。"],
+        )
+        self.assertEqual(bound.count("(S1)"), 1)
 
     def test_h3_compiler_keeps_local_source_separate(self):
         local = "integrated_multimodal_description: 当前分段动作\n\noverall_soundscape: 雨声\n\nnon_diegetic_music: N/A"
@@ -485,6 +659,24 @@ class PromptAssistantTests(unittest.TestCase):
         self.assertEqual(timeline["shots"][0]["metadata"]["aipm_source_prompt"], "远端原始")
         self.assertEqual(response["result"][3], "独立执行成品")
 
+    def test_cinetimeline_adapter_preserves_remote_segment_transition(self):
+        package = {
+            "schema": "aipm_video_timeline", "revision": 1,
+            "global": {"prompt": "电影风格", "negative_prompt": "", "reference_ids": []},
+            "segments": [
+                {"segment_id": "SEGMENT_001", "duration": 5, "timeline_local_prompt": "建立场景",
+                 "transition": "cut", "reference_ids": [], "effective_reference_ids": []},
+                {"segment_id": "SEGMENT_002", "duration": 5, "timeline_local_prompt": "近景连续动作",
+                 "transition": "motion_context", "reference_ids": [], "effective_reference_ids": []},
+                {"segment_id": "SEGMENT_003", "duration": 5, "timeline_local_prompt": "切回远景",
+                 "transition": "cut", "reference_ids": [], "effective_reference_ids": []},
+            ],
+            "reference_profiles": [], "video_prompt": "建立场景",
+        }
+        timeline = nodes.AIPMCineTimelineAdapter().convert(package, 24, "motion_context")["result"][0]
+        self.assertEqual([shot["transition"] for shot in timeline["shots"]],
+                         ["cut", "motion_context", "cut"])
+
     def test_cinetimeline_adapter_preserves_reloadable_reference_assets(self):
         package = {
             "schema": "aipm_video_timeline", "revision": 1,
@@ -506,6 +698,77 @@ class PromptAssistantTests(unittest.TestCase):
         self.assertEqual(reference["asset_id"], "aipm_assets/aipm_test.png")
         self.assertEqual(reference["scope"], "global")
         self.assertEqual(reference["metadata"]["sha256"], "abc")
+
+    def test_keyframe_adapter_has_no_global_references_and_repeats_order_per_segment(self):
+        profiles = [
+            {"picture_id": f"<Picture {index}>", "asset_id": f"frame{index}.png"}
+            for index in range(1, 4)
+        ]
+        package = {
+            "schema": "aipm_video_timeline", "revision": 1,
+            "generation_mode": "h3_keyframe",
+            "global": {"prompt": "电影风格", "negative_prompt": "", "reference_ids": []},
+            "segments": [{
+                "segment_id": f"SEGMENT_{index:03d}", "duration": 5,
+                "timeline_local_prompt": "动作", "compiled_prompt": "成品",
+                "reference_ids": [item["picture_id"] for item in profiles],
+                "effective_reference_ids": [item["picture_id"] for item in profiles],
+            } for index in range(1, 3)],
+            "reference_profiles": profiles, "video_prompt": "成品",
+        }
+        timeline = nodes.AIPMCineTimelineAdapter().convert(package, 24, "cut")["result"][0]
+        self.assertEqual(timeline["schema"], "cine_keyframe_timeline")
+        self.assertFalse(any(ref["scope"] == "global" for ref in timeline["references"]))
+        self.assertEqual(len(timeline["references"]), 6)
+        first_segment = [ref for ref in timeline["references"] if ref["shot_id"] == "SEGMENT_001"]
+        self.assertEqual([ref["asset_id"] for ref in first_segment], ["frame1.png", "frame2.png", "frame3.png"])
+        self.assertEqual([ref["keyframe_role"] for ref in first_segment], ["first", "guide", "last"])
+        self.assertEqual([ref["keyframe_frame"] for ref in first_segment], [0, 60, 119])
+
+    def test_keyframe_adapter_uses_remote_planned_middle_frame(self):
+        profiles = [
+            {"picture_id": f"<Picture {index}>", "asset_id": f"frame{index}.png"}
+            for index in range(1, 4)
+        ]
+        bindings = [
+            {"reference_id": "<Picture 1>", "local_frame": 0, "placement_reason": "首帧"},
+            {"reference_id": "<Picture 2>", "local_frame": 83, "placement_reason": "动作落点"},
+            {"reference_id": "<Picture 3>", "local_frame": 119, "placement_reason": "尾帧"},
+        ]
+        package = {
+            "schema": "aipm_video_timeline", "generation_mode": "h3_keyframe",
+            "global": {"prompt": "", "negative_prompt": "", "reference_ids": []},
+            "segments": [{
+                "segment_id": "SEGMENT_001", "duration": 5, "timeline_local_prompt": "动作",
+                "reference_ids": [item["picture_id"] for item in profiles],
+                "effective_reference_ids": [item["picture_id"] for item in profiles],
+                "keyframe_bindings": bindings,
+            }],
+            "reference_profiles": profiles, "video_prompt": "动作",
+        }
+        timeline = nodes.AIPMCineTimelineAdapter().convert(package, 24, "cut")["result"][0]
+        self.assertEqual([ref["keyframe_frame"] for ref in timeline["references"]], [0, 83, 119])
+        self.assertEqual(timeline["references"][1]["keyframe_placement_reason"], "动作落点")
+
+    def test_keyframe_adapter_without_images_is_text_to_video_conditioning(self):
+        package = {
+            "schema": "aipm_video_timeline", "generation_mode": "h3_keyframe",
+            "global": {"prompt": "电影风格", "negative_prompt": "", "reference_ids": []},
+            "segments": [{
+                "segment_id": "SEGMENT_001", "duration": 5,
+                "timeline_local_prompt": "人物从门口走到窗边", "effective_reference_ids": [],
+            }],
+            "reference_profiles": [], "video_prompt": "人物从门口走到窗边",
+        }
+        timeline = nodes.AIPMCineTimelineAdapter().convert(package, 24, "cut")["result"][0]
+        self.assertEqual(timeline["schema"], "cine_keyframe_timeline")
+        self.assertEqual(timeline["references"], [])
+        self.assertEqual(timeline["metadata"]["conditioning_mode"], "text_to_video")
+
+    def test_keyframe_timeline_cache_unwraps_authoring_package(self):
+        authoring = {"schema": "aipm_video_timeline", "video_prompt": "成品提示词"}
+        cached = {"schema": "cine_keyframe_timeline", "metadata": {"aipm": authoring}}
+        self.assertIs(nodes.AIPMVideoPromptCore._authoring_data(cached), authoring)
 
     def test_cinetimeline_adapter_maps_video_and_audio_assets(self):
         package = {
@@ -572,6 +835,49 @@ class PromptAssistantTests(unittest.TestCase):
         self.assertEqual(len(package["segments"]), 2)
         self.assertEqual(package["global"]["reference_ids"], ["<Picture 1>"])
         self.assertEqual(len(calls), 2)
+
+    def test_multimodal_reference_used_by_every_segment_is_promoted_global(self):
+        node = nodes.AIPMVideoPromptCore()
+        original_object = nodes.OpenAICompatibleClient.request_object
+        original_text = nodes.OpenAICompatibleClient.request_text
+        plan = {
+            "global_prompt": "统一风格", "global_negative_prompt": "",
+            "global_reference_ids": [], "global_reference_bindings": [],
+            "segments": [
+                {"segment_id": "a", "title": "起", "duration": 15, "brief": "人物进门",
+                 "negative_prompt": "", "reference_ids": ["<Picture 1>"], "dialogue_lines": [],
+                 "opening_state": "门外", "ending_state": "门内", "continuity_from_previous": ""},
+                {"segment_id": "b", "title": "承", "duration": 15, "brief": "人物查看桌面",
+                 "negative_prompt": "", "reference_ids": ["<Picture 1>"], "dialogue_lines": [],
+                 "opening_state": "门内", "ending_state": "桌旁", "continuity_from_previous": "承接"},
+            ],
+        }
+        nodes.OpenAICompatibleClient.request_object = classmethod(
+            lambda cls, *args, **kwargs: (plan, {"usage": {}})
+        )
+        nodes.OpenAICompatibleClient.request_text = classmethod(
+            lambda cls, *args, **kwargs: (
+                "integrated_multimodal_description: [Shot 1] 人物完成当前阶段动作并稳定落定，镜头清晰连续。\n\n"
+                "overall_soundscape: 环境声。\n\nnon_diegetic_music: N/A", {"usage": {}}
+            )
+        )
+        try:
+            result = node.generate_timeline_package(
+                service_url="http://host/v1", service_model="model", profile="MiniMax H3",
+                mode="h3_ref2va", idea="两段剧情", duration_seconds=15, segment_count=2,
+                aspect_ratio="16:9", requested_language="中文（推荐）",
+                skill_id="aipm-minimax-h3-video", skill="skill",
+                reference_profiles=[{"picture_id": "<Picture 1>", "visual_profile": "人物"}],
+                cache_hits=0, has_video=False, has_audio=False, previous=None, modification="",
+            )
+        finally:
+            nodes.OpenAICompatibleClient.request_object = original_object
+            nodes.OpenAICompatibleClient.request_text = original_text
+        package = json.loads(result["ui"]["text"][2])["metadata"]["aipm"]
+        self.assertEqual(package["global"]["reference_ids"], ["<Picture 1>"])
+        self.assertEqual([item["reference_ids"] for item in package["segments"]], [[], []])
+        self.assertEqual([item["effective_reference_ids"] for item in package["segments"]],
+                         [["<Picture 1>"], ["<Picture 1>"]])
 
     def test_multi_segment_failure_returns_checkpoint_and_resumes_at_failed_segment(self):
         node = nodes.AIPMVideoPromptCore()
@@ -666,7 +972,7 @@ class PromptAssistantTests(unittest.TestCase):
         try:
             response = node.generate(
                 "雨夜侦探听见身后脚步并回头", "http://host/v1", "model.gguf",
-                "MiniMax H3（自动判断模式）", "自动判断（推荐）", 8, "16:9", "中文（推荐）", 1,
+                "MiniMax H3（自动判断模式）", "文生视频", 8, "16:9", "中文（推荐）", 1,
                 修改意见="__AIPM_RUN_V1__test",
             )
         finally:
@@ -779,7 +1085,7 @@ class PromptAssistantTests(unittest.TestCase):
         target = inputs["required"]["目标模型"]
         self.assertIsInstance(target[0], list)
         self.assertIn("Krea 2 / Krea 2 Turbo 文生图", target[0])
-        self.assertIn("MiniMax H3（自动判断模式）", target[0])
+        self.assertIn("MiniMax H3", target[0])
         self.assertEqual(target[1]["default"], "自动判断 / 通用（推荐）")
         self.assertEqual(nodes.AIPMPromptRefinement.RETURN_NAMES[-1], "完整结果 JSON")
         skill_id, skill = nodes.load_prompt_skill("__refinement__")
@@ -796,7 +1102,7 @@ class PromptAssistantTests(unittest.TestCase):
 
     def test_refinement_profile_resolution(self):
         self.assertEqual(nodes.resolve_refinement_profile("生图提示词", "Krea2"), "Krea 2 / Krea 2 Turbo 系列")
-        self.assertEqual(nodes.resolve_refinement_profile("生视频提示词", "MiniMax H3"), "MiniMax H3（自动判断模式）")
+        self.assertEqual(nodes.resolve_refinement_profile("生视频提示词", "MiniMax H3"), "MiniMax H3")
 
 
 if __name__ == "__main__":

@@ -66,7 +66,7 @@ non_diegetic_music:
 
 - `[Shot 1]` has no timestamp. Later cuts begin `[Shot N] At MM:SS.mmm, ...` with strictly increasing times inside the duration. Add a cut only when it reveals new subject, space, state, viewpoint, or time; otherwise move the camera.
 - Express camera motion naturally inside the shot. When meaningful specify type + amplitude + speed: push/pull, zoom, pan, truck, tilt, pedestal, arc, tracking, static, shake, POV, or roll.
-- Assign actual vocal sources stable `(S1)`, `(S2)` IDs in speaking order. Put speaker identity, voice/delivery, and action outside `<d>`; put only exact words inside, for example `<d>[Chinese] 我会回来。</d>`.
+- Assign actual vocal sources stable `(S1)`, `(S2)` IDs in speaking order. An ID identifies a vocal source: reuse the same ID whenever that source speaks, attach it exactly once within each vocal clause, and never repeat the same ID around one `<d>` block. Put speaker identity, voice/delivery, and action outside `<d>`; put only exact words inside, for example `The woman (S1) says softly: <d>[Chinese] 我会回来。</d>`.
 - Only characters who actually vocalize receive an `(S N)` ID. When dialogue is requested but its wording is unspecified, invent the line before applying this syntax; when wording is supplied, do not paraphrase it.
 - Voiceover must use `says in an off-screen voiceover` and state that the corresponding visible character's lips remain completely closed.
 - Use `<scenetrans>` when speech crosses a cut and explicitly state audio continuity. Use `<cutoff>` when the ending truncates speech.
@@ -85,6 +85,7 @@ Before returning JSON, verify:
 - shot times, duration, endpoint alignment, action physics, and camera continuity agree;
 - dialogue, lyrics, visible text, and user wording are not translated or rewritten;
 - every requested speaking beat contains actual dialogue/voiceover words rather than a speech placeholder, and the line fits the shot duration;
+- every vocal clause contains exactly one stable speaker ID, with no duplicate `(S N)` before or around the same `<d>` block;
 - performance is observable, audio is synchronized, and the final state is settled;
 - `video_prompt` contains no Chinese editor headings, Markdown, negative-prompt block, or generation parameters.
 

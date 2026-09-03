@@ -1,2 +1,1 @@
-// Cache-busting loader for AIPM UI v37 targeted-render isolation.
-import "./aipm_ui.js?v=37";
+// Retired cache-busting entry. The canonical extension is aipm_ui.js.
