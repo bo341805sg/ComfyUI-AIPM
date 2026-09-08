@@ -3,27 +3,27 @@ name: aipm-illustrious-booru
 description: Generate professional Danbooru-style prompts for Illustrious, NoobAI, and compatible anime-tag models, with precise character binding, mandatory visual emphasis, composition, rendering quality, and model-appropriate negatives.
 ---
 
-# Illustrious / NoobAI / Anima 标签导演
+# Illustrious / NoobAI 标签导演
 
 ## 模型卡优先规则
 
 - NoobAI XL 1.1 官方模型卡推荐 `masterpiece, best quality, newest, absurdres, highres, safe`，并规定人数/角色/系列/artist/special/general/other 的 caption 顺序。
-- Illustrious 与 Anima 派生模型可能采用不同质量标签。只有目标为 NoobAI 兼容 checkpoint 时强制上述前缀；其他模型先遵循其模型卡，禁止把单一前缀冒充全系列官方规则。
+- Illustrious 派生模型可能采用不同质量标签。只有目标为 NoobAI 兼容 checkpoint 时使用上述前缀；其他模型先遵循其模型卡。Anima 由独立技能处理，不属于本路由。
 
 ## 不可省略的提交清单
 
-每次正向提示词必须同时做到：
+按任务选择适用项，不为完成清单增加对象或改变风格：
 
-1. **质量口令**：NoobAI 兼容模型原样使用其推荐前缀；Illustrious/Anima 使用目标模型卡的质量标签。模型不明时使用保守的 `masterpiece, best quality, highres`，并仍补足具体画质。
+1. **质量口令**：NoobAI 兼容模型使用其推荐前缀；Illustrious 使用目标模型卡的质量标签。模型不明时避免强制版本专用口令。
 2. **主体锚定**：人数、身份、稳定五官/发型/体型、服装和关键道具。
-3. **表演可见**：动作、重心、手势、视线、表情或微表情至少覆盖三项。
+3. **表演可见**：只选能在当前景别看见、且对动作有用的表现；非人物图不强加表情或肢体。
 4. **画面设计**：景别、机位/视角、主体位置或视觉动线、景深/透视。
 5. **光色设计**：真实主光来源、光质、色温/主辅色、明暗或冷暖对比。
-6. **材质设计**：至少写两种与画面相关的具体材质表现。
-7. **画质落实**：至少四个具体可见标签，例如 detailed eyes, precise eye highlights, coherent anatomy, plausible hands, clean lineart, controlled shading, readable fabric folds, material-specific highlights, atmospheric perspective, crisp focal subject。只选与画面相关者。
-8. **重点加权**：对 1–3 个真正关键的主体、动作或道具使用温和 `(concept:1.1–1.3)`；不得全词加权。
+6. **材质设计**：仅描述已有物体的相关材质，不凑数量。
+7. **画质落实**：按画面选择 clean lineart、controlled shading、crisp focal subject 等具体结果，不限定标签数量。
+8. **重点加权**：优先清楚语序；仅工作流支持且确有必要时对少量关键概念温和加权，不强制加权。
 
-缺少任何一项都继续完善，不得提前输出。
+无关项直接省略；核心要求完整且不矛盾即可输出。
 
 ## 标签编排
 

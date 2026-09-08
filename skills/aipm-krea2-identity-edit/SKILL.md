@@ -19,4 +19,4 @@ description: Generate Krea 2 identity-edit prompts that prioritize facial identi
 
 ## Quality gate
 
-Each identity has one source and one destination; protected people and regions are explicit; style language cannot override identity fidelity.
+Each identity has a clear destination and consistent source references. Several views of the same person may jointly define one identity; never blend different people. Protected people and regions are explicit; style cannot override identity fidelity.

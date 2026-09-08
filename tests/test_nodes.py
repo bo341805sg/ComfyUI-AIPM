@@ -11,6 +11,123 @@ SPEC.loader.exec_module(nodes)
 
 
 class PromptAssistantTests(unittest.TestCase):
+    def test_reference_cache_separates_request_context(self):
+        from unittest.mock import patch
+        nodes.ReferenceAnalysisPipeline._image_cache.clear()
+        images = [{"sha256": "a", "data_url": "unused"}, {"sha256": "b", "data_url": "unused"}]
+        def respond(url, payload, **kwargs):
+            instruction = json.loads(payload["messages"][0]["content"][0]["text"])
+            return {"choices": [{"message": {"content": json.dumps([url, payload["model"], instruction])}}]}
+        analyze = nodes.ReferenceAnalysisPipeline.analyze_images
+        try:
+            with patch.object(nodes.OpenAICompatibleClient, "request", side_effect=respond) as request:
+                first, hits = analyze("http://one/v1", "model", images, "identity")
+                self.assertEqual(hits, 0)
+                repeated, hits = analyze("http://one/v1", "model", images, "identity")
+                self.assertEqual(hits, 2)
+                self.assertEqual(first, repeated)
+                for url, model, refs, hint in [
+                    ("http://one/v1", "model", images, "clothing only"),
+                    ("http://two/v1", "model", images, "identity"),
+                    ("http://one/v1", "other-model", images, "identity"),
+                    ("http://one/v1", "model", list(reversed(images)), "identity"),
+                ]:
+                    with self.subTest(url=url, model=model, hint=hint, order=refs):
+                        changed, hits = analyze(url, model, refs, hint)
+                        self.assertEqual(hits, 0)
+                        self.assertNotEqual(changed, first)
+                self.assertEqual(request.call_count, 10)
+        finally:
+            nodes.ReferenceAnalysisPipeline._image_cache.clear()
+
+    def test_all_runtime_skill_routes_share_contract_once(self):
+        profiles = list(nodes.PROMPT_SKILL_BY_PROFILE) + list(nodes.VIDEO_PROMPT_SKILL_BY_PROFILE) + ["__refinement__"]
+        for profile in profiles:
+            with self.subTest(profile=profile):
+                _, text = nodes.load_prompt_skill(profile)
+                self.assertEqual(text.count("# AIPM runtime scope"), 1)
+                self.assertNotIn("\nname: aipm-", text)
+        _, h3 = nodes.load_prompt_skill("MiniMax H3", "h3_ref2va")
+        self.assertIn("without a JSON wrapper", h3)
+        self.assertIn("subject_definitions:", h3)
+        self.assertNotIn("otherwise move the camera", h3)
+
+    def test_dialogue_requirement_negation_and_mixed_intent(self):
+        for idea in ["无对白", "不要添加台词", "不需要任何对白", "角色不说话", "没有旁白", "without dialogue", "no voice-over", "风景静默"]:
+            self.assertFalse(nodes.requires_planned_dialogue(idea), idea)
+        for idea in ["需要对白", "不要旁白，林说一句你好", "无对白，但需要旁白", "林说：你好", "no voice-over, Alice says hello"]:
+            self.assertTrue(nodes.requires_planned_dialogue(idea), idea)
+
+    def test_explicit_repeat_does_not_disable_accidental_duplicate_guard(self):
+        for idea in ["重复演示", "明确要求两段重复同一动作", "请重复", "please repeat the same action"]:
+            self.assertTrue(nodes.explicitly_allows_repeated_segments(idea), idea)
+        for idea in ["三段推进剧情", "不要重复演示", "避免重复剧情", "do not repeat the same action"]:
+            self.assertFalse(nodes.explicitly_allows_repeated_segments(idea), idea)
+
+    def test_multimodal_frame_normalization_preserves_keyframe_mode(self):
+        import copy
+        original = {"segments": [{"reference_ids": ["<Picture 1>"], "brief": "穿绿色外套", "keyframe_bindings": [{"reference_id": "<Picture 1>", "local_frame": 120}], "keyframe_transitions": ["变化"]}]}
+        plan = copy.deepcopy(original)
+        nodes.normalize_plan_mode(plan, "h3_keyframe")
+        self.assertEqual(plan, original)
+        nodes.normalize_plan_mode(plan, "h3_ref2va")
+        self.assertEqual(plan["segments"][0]["keyframe_bindings"], [])
+        self.assertEqual(plan["segments"][0]["reference_ids"], ["<Picture 1>"])
+        self.assertEqual(plan["segments"][0]["brief"], "穿绿色外套")
+
+    def test_real_planner_validator_silence_duplicates_and_mode_routing(self):
+        from unittest.mock import patch
+        import copy
+        class Captured(BaseException):
+            pass
+        def capture(idea):
+            holder = {}
+            def intercepted(cls, *args, **kwargs):
+                holder["validate"] = kwargs["validator"]
+                raise Captured()
+            with patch.object(nodes.OpenAICompatibleClient, "request_object", classmethod(intercepted)):
+                with self.assertRaises(Captured):
+                    nodes.AIPMVideoPromptCore().generate_timeline_package(
+                        service_url="http://unused/v1", service_model="test", profile="MiniMax H3", mode="h3_ref2va", idea=idea,
+                        duration_seconds=15, segment_count=2, aspect_ratio="16:9", requested_language="中文",
+                        skill_id="aipm-minimax-h3-video", skill="test", reference_profiles=[], cache_hits=0,
+                        has_video=False, has_audio=False, previous=None, modification="")
+            return holder["validate"]
+        segment = dict(brief="动作", opening_state="开始", ending_state="结束", dialogue_lines=[], keyframe_bindings=[{"local_frame": 0}], keyframe_transitions=[])
+        duplicate = {"segments": [copy.deepcopy(segment), copy.deepcopy(segment)]}
+        capture("无对白，明确要求重复演示")(duplicate)
+        self.assertEqual(duplicate["segments"][0]["keyframe_bindings"], [])
+        with self.assertRaisesRegex(nodes.PromptAssistantError, "重复剧情"):
+            capture("无对白，剧情不要重复")(copy.deepcopy(duplicate))
+        with self.assertRaisesRegex(nodes.PromptAssistantError, "实际台词"):
+            capture("请安排对白，重复演示")(copy.deepcopy(duplicate))
+
+    def test_h3_planning_review_is_loaded_into_planning_context(self):
+        review = nodes.load_h3_planning_review()
+        self.assertIn("24fps", review)
+        self.assertIn("非多模态模式保持全局参考为空", review)
+        self.assertIn("用户明确要求重复", review)
+        self.assertIn("续写不重写旧段", review)
+        self.assertIn('"planning_review": load_h3_planning_review()', (ROOT / "nodes.py").read_text(encoding="utf-8"))
+
+    def test_h3_review_not_injected_into_image_or_base_reference(self):
+        _, image = nodes.load_prompt_skill("Anima 系列")
+        _, base = nodes.load_prompt_skill("MiniMax H3 FL2VA（首尾帧）", "h3_fl2va")
+        _, ref = nodes.load_prompt_skill("MiniMax H3 Ref2VA（多参考）", "h3_ref2va")
+        self.assertNotIn("Two-speaker example fragment", image)
+        self.assertNotIn("Two-speaker example fragment", base)
+        self.assertIn("Two-speaker example fragment", ref)
+        self.assertNotIn("AIPM 分段与素材检查（仅用于规划请求）", ref)
+
+    def test_h3_planning_review_missing_or_empty_fails_explicitly(self):
+        from unittest.mock import patch
+        with patch.object(pathlib.Path, "is_file", return_value=False):
+            with self.assertRaises(nodes.PromptAssistantError):
+                nodes.load_h3_planning_review()
+        with patch.object(pathlib.Path, "read_text", return_value=" "):
+            with self.assertRaises(nodes.PromptAssistantError):
+                nodes.load_h3_planning_review()
+
     def test_only_image_and_video_nodes_are_registered(self):
         self.assertEqual(
             set(nodes.NODE_CLASS_MAPPINGS),
@@ -70,7 +187,8 @@ class PromptAssistantTests(unittest.TestCase):
         self.assertIn("const acceptResult = (output)", ui)
         self.assertIn("node.onExecuted = nodeExecuted", ui)
         self.assertIn("node.onSerialize = serialize", ui)
-        self.assertIn("previousResult.value = String(this.properties.aipm_previous_result)", ui)
+        self.assertIn('previousResult.value = String(this.properties.aipm_previous_result || "")', ui)
+        self.assertIn('if (!requestState.running || !Array.isArray(output?.text)) return;', ui)
 
     def test_frontend_only_native_controls_never_enter_positional_widget_values(self):
         ui = (ROOT / "web" / "aipm_ui.js").read_text(encoding="utf-8")
@@ -95,8 +213,10 @@ class PromptAssistantTests(unittest.TestCase):
         self.assertIn('if (index === 0 || shot.metadata.new_scene === true) shot.transition = "cut"', ui)
         self.assertIn('else if (!["cut", "motion_context"].includes(shot.transition))', ui)
         self.assertIn('const resultOperation = String(authoring?.aipm_operation || "")', ui)
-        self.assertIn('next = { ...parsed, shots: incoming.map((shot) => {', ui)
-        self.assertIn('metadata: { ...(shot.metadata || {}), render: oldRender }', ui)
+        self.assertIn('next = { ...parsed, ...current, total_frames: totalFrames,', ui)
+        self.assertIn('shots: [...existing, ...additions]', ui)
+        self.assertIn('if (!additions.length) continue;', ui)
+        self.assertIn('Number(shot.start_frame) < existingEnd', ui)
         self.assertNotIn('current?.metadata?.render_target_shot_id', ui)
 
     def test_generate_buttons_keep_fixed_labels_and_width_while_running(self):
@@ -131,7 +251,10 @@ class PromptAssistantTests(unittest.TestCase):
             self.assertNotIn('import "./aipm_ui.js?', source, entry.name)
             self.assertNotIn("app.registerExtension", source, entry.name)
         ui = (web / "aipm_ui.js").read_text(encoding="utf-8")
-        self.assertIn("globalThis.__COMFYUI_AIPM_UI_VERSION__ < 76", ui)
+        import re
+        version = re.search(r"const VERSION = (\d+);", ui).group(1)
+        self.assertIn(f"globalThis.__COMFYUI_AIPM_UI_VERSION__ < {version}", ui)
+        self.assertIn(f"globalThis.__COMFYUI_AIPM_UI_VERSION__ = {version}", ui)
         self.assertIn('"CineTimelinePlan", "CineTimelineKeyframePlan"', ui)
         self.assertIn("const link = activeGraph.links?.[linkId]", ui)
         self.assertIn("writeTextToLinkedPreviews(node, output)", ui)
@@ -140,7 +263,9 @@ class PromptAssistantTests(unittest.TestCase):
     def test_all_prompt_nodes_have_offline_cached_output_button(self):
         ui = (ROOT / "web" / "aipm_ui.js").read_text(encoding="utf-8")
         self.assertIn('node.addWidget("button", "输出缓存"', ui)
-        self.assertIn("cacheButton.callback = async () =>", ui)
+        self.assertIn("async function outputCachedResult()", ui)
+        self.assertIn('null, outputCachedResult, { serialize: false }', ui)
+        self.assertIn('null, clearCachedResult, { serialize: false }', ui)
         self.assertIn('node.addDOMWidget?.("aipm_image_actions"', ui)
         self.assertIn('setStatus("正在从本地缓存重新输出，不调用远程服务……")', ui)
         self.assertIn('currentAction === "cache"', ui)
@@ -365,7 +490,7 @@ class PromptAssistantTests(unittest.TestCase):
         _, anima = nodes.load_prompt_skill("Anima 系列")
         self.assertIn("清晰自然语言", flux)
         self.assertIn("英文双引号", flux)
-        self.assertIn("年龄段、脸型与骨相", qwen)
+        self.assertIn("景别可见且参考支持", qwen)
         self.assertIn("内容、主体和构图", krea)
         self.assertIn("NoobAI XL 1.1 官方模型卡", noobai)
         self.assertIn("Anima 是独立的动漫/插画模型家族", anima)
@@ -405,7 +530,8 @@ class PromptAssistantTests(unittest.TestCase):
         schema = nodes.AIPMImagePrompt.response_format()["json_schema"]["schema"]
         self.assertIn("quality_features", schema["required"])
         self.assertIn("emphasis_features", schema["required"])
-        self.assertGreaterEqual(schema["properties"]["quality_features"]["minItems"], 4)
+        self.assertEqual(schema["properties"]["quality_features"].get("minItems", 0), 0)
+        self.assertEqual(schema["properties"]["emphasis_features"].get("minItems", 0), 0)
 
     def test_transient_connection_error_is_retried(self):
         calls = []
@@ -549,7 +675,6 @@ class PromptAssistantTests(unittest.TestCase):
         ui = (ROOT / "web" / "aipm_ui.js").read_text(encoding="utf-8")
         self.assertIn("const videoPromptPreview = isVideo &&", ui)
         self.assertIn("if (videoPromptPreview) nativeWidgets.push(videoPromptPreview)", ui)
-        self.assertIn("const VERSION = 76", ui)
         self.assertIn('panelRoot.className = "aipm-image-actions-v76"', ui)
         self.assertIn('gridAutoRows: "20px"', ui)
         self.assertIn('alignContent: "start"', ui)
@@ -557,10 +682,10 @@ class PromptAssistantTests(unittest.TestCase):
         self.assertIn("contentInput._aipmAdaptiveHeight = adaptiveHeight", ui)
         self.assertIn("resizeContentInput(Number(nextSize[1]))", ui)
         self.assertIn("node._aipmFitContentInput = () =>", ui)
-        self.assertIn("contentInput._aipmAdaptiveHeight + targetHeight - naturalHeight", ui)
+        self.assertIn("72 + Number(nextHeight) - (minimumHeight || Number(nextHeight)) - 8", ui)
         self.assertIn("panelWidget.computeSize = (width) => [width, 86]", ui)
         self.assertIn("contentInput._aipmAdaptiveHeight = 72", ui)
-        self.assertIn("targetHeight - naturalHeight - 8", ui)
+        self.assertIn("this.bodyHeight - start - occupied - 8", ui)
         self.assertIn('"正向提示词": textValues[0]', ui)
         self.assertIn('String(targetInput?.type || "").toUpperCase() !== "STRING"', ui)
         self.assertIn("targetWidget.value = String(value)", ui)

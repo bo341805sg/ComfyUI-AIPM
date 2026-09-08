@@ -21,6 +21,10 @@ non_diegetic_music:
 - `detailed_description` uses `[Shot 1]`, timed later shots, stable `(SN)` speakers, `<d>[Language] ...</d>`, `<scenetrans>`, and `<cutoff>` under the same timeline rules as Base mode.
 - Preserve reference identity, costume, prop ownership, contact points, spatial direction, light direction, and motion phase where requested. Do not falsely promise pixel-perfect identity.
 
+Multi-reference transfer check: distinguish the source of each attribute before writing. Two views of one person remain one subject; a clothing-only source must not replace that person's face. A group image does not imply one subject. Preserve the planner's global/local reference responsibilities; do not promote every active source to a universal anchor.
+
+Two-speaker example fragment (syntax only; never reuse its names or dialogue): `<Subject 1>` is defined by `<Picture 1>` and `<Subject 2>` by `<Picture 2>`. If the approved plan says the woman speaks first and the man replies, write `女子 (S1) 问道：<d>[Chinese] 准备好了吗？</d> 男子先安静听完，再 (S2) 回答：<d>[Chinese] 可以出发了。</d>` inside detailed_description. Keep one ID per vocal clause; do not add narration or make the listener echo. A third clothing-detail image for Subject 1 supplies only the approved clothing attributes, not a third speaker or a new face. Keep the full six-section output; this fragment is not a replacement schema.
+
 Integrated example (structure, not reusable content):
 
 ```text

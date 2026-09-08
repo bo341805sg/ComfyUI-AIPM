@@ -7,6 +7,8 @@ description: Generate MiniMax H3 machine prompts in the official Context-IR dial
 
 Upstream specification: MiniMax-AI/MiniMax-H3 official `h3-prompt-writing` skill and its Base/Ref2VA guides, reviewed 2026-08-22. The runtime appends only the official mode reference selected for the current request; do not blend another mode's format into the result.
 
+The timeline planner separately receives `references/planning-review.md` for segment progression, boundary continuity and media responsibilities. Do not reproduce its checklist in the output. Follow the current segment plan and active references; do not re-plan the whole film or import example story content into a segment prompt.
+
 Turn a creative request into one executable audiovisual timeline for MiniMax H3. `video_prompt` is a machine-facing H3 prompt. Keep the official structural field names, control tokens, task types, and retention markers in English, but write all descriptive prose in the language requested by the node. When Chinese is requested, the shot descriptions, reference explanations, performance, camera, lighting, soundscape, and music descriptions must be Chinese. Preserve dialogue/lyrics and visible on-screen text in their original language.
 
 ## Official format routing
@@ -58,13 +60,14 @@ non_diegetic_music:
 3. Give the shot one dominant dramatic change, one dominant subject action, and at most one dominant camera response per phase. Reduce action load when duration is short.
 4. Direct observable performance. For people, specify gaze, eyelids/brows/mouth tension, breath, posture, weight shift, hand behavior, listening/reaction, and the aftereffect appropriate to shot size. Never substitute an emotion label for behavior.
 5. State camera start, motivation/trigger, movement or hold, reframing/focus target, and final composition. Camera movement must reveal information, preserve action readability, or change emotional access.
-6. Protect physical continuity: identity, face, costume, anatomy, prop ownership, contact points, screen direction, environment, light direction, and action momentum.
+6. Protect identity and physical continuity while allowing planned state changes. Keep garment design stable, not its wearing state during removal. Bind actions and prop transfers to their actual phases; global text and negatives must not forbid a valid opening or intermediate state.
 7. Design sound as synchronized events: dialogue/voice, ambience, Foley/contact, and music. If the user supplies exact dialogue, preserve it verbatim. If the user asks for dialogue, speech, narration, or a speaking beat without supplying the words, actively write concise, character-appropriate, speakable lines that advance the current dramatic beat and fit the available duration; never replace the words with a placeholder such as "the character speaks." If there is no non-diegetic music, say so explicitly.
 8. Spend detail only on visible or audible results. Do not add sampler, CFG, steps, resolution flags, or unsupported provider parameters.
+9. Match action detail to supplied evidence. If garment construction or joint mechanics are unspecified, keep that phase as a single action verb; describe only the known start, ownership and endpoint. Example of sufficient detail: `她脱下雨衣，双手持衣转向椅子，将雨衣搭在椅背上。` This is a level-of-detail example, not required story content. Reference roles establish identity/design, not observed fasteners or anatomical facts. Resolve routine gaps with neutral wording rather than questions or invented mechanics.
 
 ## Timeline, camera, dialogue, and sound syntax
 
-- `[Shot 1]` has no timestamp. Later cuts begin `[Shot N] At MM:SS.mmm, ...` with strictly increasing times inside the duration. Add a cut only when it reveals new subject, space, state, viewpoint, or time; otherwise move the camera.
+- `[Shot 1]` has no timestamp. Later cuts begin `[Shot N] At MM:SS.mmm, ...` with strictly increasing times inside the duration. Add a cut only when it reveals new subject, space, state, viewpoint, or time. Otherwise keep the shot; a static camera is valid, movement is not mandatory.
 - Express camera motion naturally inside the shot. When meaningful specify type + amplitude + speed: push/pull, zoom, pan, truck, tilt, pedestal, arc, tracking, static, shake, POV, or roll.
 - Assign actual vocal sources stable `(S1)`, `(S2)` IDs in speaking order. An ID identifies a vocal source: reuse the same ID whenever that source speaks, attach it exactly once within each vocal clause, and never repeat the same ID around one `<d>` block. Put speaker identity, voice/delivery, and action outside `<d>`; put only exact words inside, for example `The woman (S1) says softly: <d>[Chinese] 我会回来。</d>`.
 - Only characters who actually vocalize receive an `(S N)` ID. When dialogue is requested but its wording is unspecified, invent the line before applying this syntax; when wording is supplied, do not paraphrase it.
@@ -77,7 +80,7 @@ non_diegetic_music:
 
 ## Quality gate
 
-Before returning JSON, verify:
+Before returning the current stage's requested artifact, verify:
 
 - checkpoint format and section order are exact;
 - official syntax remains English while all descriptive prose follows the requested language consistently;
@@ -89,4 +92,4 @@ Before returning JSON, verify:
 - performance is observable, audio is synchronized, and the final state is settled;
 - `video_prompt` contains no Chinese editor headings, Markdown, negative-prompt block, or generation parameters.
 
-Return the node's other structured JSON fields as concise planning metadata, but make `video_prompt` the complete official-format H3 machine prompt.
+Follow the caller's output contract: when requesting a segment prompt as plain text, return only the complete H3 prompt, without a JSON wrapper. When requesting JSON, put that prompt in `video_prompt` and return only the requested metadata fields. Do not switch contracts based on these examples.

@@ -8,9 +8,9 @@ description: Generate FLUX.2 single- and multi-reference edit prompts with per-i
 ## Non-negotiables
 
 1. Start with the edit operation and target: add, remove, replace, restyle, relight, reposition, composite, inpaint, or outpaint.
-2. Assign every connected `<Picture N>` exactly one explicit role. State which traits transfer, where they appear, and which background, pose, person, text, or framing must not transfer.
+2. Account for every connected `<Picture N>` with its assigned role or roles; one image may supply several compatible attributes. State what transfers, its destination and exclusions; explicitly leave an irrelevant image unused rather than forcing it into the edit.
 3. For people, keep identities separate. Never average faces. Name the target position and bind face, hair, body, clothing, and accessories to the intended reference.
-4. List protected content: identity, unedited clothing, pose, composition, background, logo, product geometry, or exact text. Do not redescribe protected content in a way that changes it.
+4. Write explicit protection in the final prompt: preserve the base image's poses, positions, framing, background and lighting unless those are requested edits. For each donor, explicitly exclude its unassigned pose, background and other content. "Use only its face and coat" does not replace these exclusions. Do not protect an attribute the user asked to change.
 5. Use English natural language; no SD weights, LoRA syntax, sampler settings, or unsupported parameters.
 
 ## Integrated pattern

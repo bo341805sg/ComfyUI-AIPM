@@ -1,10 +1,10 @@
 import { app } from "../../../scripts/app.js";
 import { api } from "../../../scripts/api.js";
 
-if (!globalThis.__COMFYUI_AIPM_UI_VERSION__ || globalThis.__COMFYUI_AIPM_UI_VERSION__ < 76) {
-  globalThis.__COMFYUI_AIPM_UI_VERSION__ = 76;
+if (!globalThis.__COMFYUI_AIPM_UI_VERSION__ || globalThis.__COMFYUI_AIPM_UI_VERSION__ < 83) {
+  globalThis.__COMFYUI_AIPM_UI_VERSION__ = 83;
 
-const VERSION = 76;
+const VERSION = 83;
 const AIPM_MIN_WIDTH = 480;
 const REVISION_MARKER = "__AIPM_REVISION_V1__";
 const RUN_MARKER = "__AIPM_RUN_V1__";
@@ -61,6 +61,9 @@ function writeTextToLinkedPreviews(node, output) {
       const target = link ? graph.getNodeById?.(link.target_id) : null;
       const type = String(target?.type || target?.comfyClass || "").toLowerCase();
       if (!target) continue;
+      // Timeline documents are imported only by the complete-result handler.
+      // A generic preview refresh must not write a partial package into them.
+      if (type.startsWith("cinetimeline")) continue;
       if (type.includes("showtext") || type.includes("displaytext") || type.includes("previewtext")) {
         target.onExecuted?.({ text: [String(value)] });
       } else {
@@ -80,6 +83,7 @@ function writeTextToLinkedPreviews(node, output) {
 }
 
 function writeResultToLinkedCineTimelines(node, rawTimelineJson, strategy = "rewrite", targetSegmentId = "") {
+  const graph = node?.graph || app.graph;
   let raw = String(rawTimelineJson || "").trim();
   if (!raw || String(node?.comfyClass || node?.type || "") !== "AIPMVideoPrompt") return 0;
   let parsed;
@@ -98,11 +102,13 @@ function writeResultToLinkedCineTimelines(node, rawTimelineJson, strategy = "rew
   const jsonOutput = (node.outputs || []).find((output) => output?.name === "完整结果 JSON");
   let updated = 0;
   for (const linkId of jsonOutput?.links || []) {
-    const link = app.graph?.links?.[linkId] || app.graph?.links?.get?.(linkId);
-    const target = link ? app.graph?.getNodeById?.(link.target_id) : null;
+    const link = graph?.links?.[linkId] || graph?.links?.get?.(linkId);
+    const target = link ? graph?.getNodeById?.(link.target_id) : null;
     if (!target || ![
       "CineTimelinePlan", "CineTimelineKeyframePlan", "CineTimelineStudio", "CineTimelineEditor",
     ].includes(String(target.comfyClass || target.type || ""))) continue;
+    const targetIsKeyframe = String(target.comfyClass || target.type || "") === "CineTimelineKeyframePlan";
+    if (targetIsKeyframe !== (parsed.schema === "cine_keyframe_timeline")) continue;
     const targetInput = target.inputs?.[link.target_slot];
     if (targetInput?.name !== "timeline_json") continue;
     const timelineWidget = target.widgets?.find((widget) => widget.name === "timeline_state");
@@ -112,28 +118,31 @@ function writeResultToLinkedCineTimelines(node, rawTimelineJson, strategy = "rew
       current = JSON.parse(String(timelineWidget.value || "{}"));
     } catch {}
     let next = parsed;
+    raw = JSON.stringify(parsed);
     if (strategy === "append" || strategy === "revise_segment") {
       const incoming = parsed.shots || [];
       const existing = Array.isArray(current?.shots) ? current.shots : [];
       if (strategy === "append") {
         const known = new Set(existing.map((shot) => String(shot?.shot_id || "")));
         const additions = incoming.filter((shot) => !known.has(String(shot?.shot_id || "")));
-        const renderById = new Map(existing.map((shot) => [
-          String(shot?.shot_id || ""), shot?.metadata?.render,
-        ]));
-        // The adapter returns the complete post-append timeline, not only the
-        // new shots. Use it as the schedule/reference source so total_frames,
-        // keyframe positions and newly scoped references advance together.
-        // Preserve local render versions for existing shots because those are
-        // browser-owned production state and are intentionally absent from
-        // the AIPM authoring cache.
-        next = { ...parsed, shots: incoming.map((shot) => {
-          const oldRender = renderById.get(String(shot?.shot_id || ""));
-          return oldRender
-            ? { ...shot, metadata: { ...(shot.metadata || {}), render: oldRender } }
-            : shot;
-        }) };
-        if (!additions.length && incoming.length <= existing.length) continue;
+        if (!additions.length) continue;
+        const existingEnd = Math.max(0, ...existing.map((shot) => Number(shot.end_frame) || 0));
+        if (additions.some((shot) => Number(shot.start_frame) < existingEnd)) {
+          throw new Error("续写分段与当前时间轴重叠，请按当前时间轴重新续写；现有内容未覆盖。");
+        }
+        // Append must preserve the editor's complete existing document.
+        const totalFrames = Math.max(existingEnd, ...additions.map((shot) => Number(shot.end_frame) || 0));
+        const oldRefs = Array.isArray(current?.references) ? current.references : [];
+        const knownRefs = new Set(oldRefs.map((ref) => String(ref.reference_id || "")));
+        const addedIds = new Set(additions.map((shot) => String(shot.shot_id || "")));
+        const newRefs = (parsed.references || []).filter((ref) =>
+          !knownRefs.has(String(ref.reference_id || "")) &&
+          (ref.scope === "global" || addedIds.has(String(ref.shot_id || ""))));
+        next = { ...parsed, ...current, total_frames: totalFrames,
+          shots: [...existing, ...additions],
+          references: [...oldRefs.map((ref) => ref.scope === "global"
+            ? { ...ref, end_frame: totalFrames } : ref), ...newRefs],
+        };
         if (Array.isArray(current?.background_music) && current.background_music.length) {
           next.background_music = current.background_music;
         }
@@ -157,7 +166,7 @@ function writeResultToLinkedCineTimelines(node, rawTimelineJson, strategy = "rew
     target.setDirtyCanvas?.(true, true);
     updated += 1;
   }
-  if (updated) app.graph?.change?.();
+  if (updated) graph?.change?.();
   return updated;
 }
 
@@ -166,7 +175,7 @@ function migrateVideoDurationWidget(node) {
   const widget = node.widgets?.find((item) => item.name === "视频时长");
   if (!widget) return;
   const matched = String(widget.value ?? "").match(/\d+/);
-  const seconds = Math.max(4, Math.min(15, matched ? Number(matched[0]) : Number(widget.value) || 5));
+  const seconds = Math.max(4, Math.min(30, matched ? Number(matched[0]) : Number(widget.value) || 15));
   widget.value = seconds;
   widget.type = "number";
   widget.options = {
@@ -241,7 +250,9 @@ function configureStableNodeLayout(node) {
 
   const resizeContentInput = (nextHeight) => {
     if (!contentInput || !Number.isFinite(Number(nextHeight))) return;
-    const adaptiveHeight = Math.max(72, contentBaselineHeight + Number(nextHeight) - resizeBaselineHeight);
+    // Recompute the budget, never accumulate an automatic resize delta.
+    const minimumHeight = Number(node.computeSize?.([Number(node.size?.[0]) || AIPM_MIN_WIDTH, 0])?.[1]);
+    const adaptiveHeight = Math.max(72, 72 + Number(nextHeight) - (minimumHeight || Number(nextHeight)) - 8);
     contentInput._aipmAdaptiveHeight = adaptiveHeight;
     const element = contentInput.element || contentInput.inputEl;
     if (element?.style) {
@@ -255,15 +266,34 @@ function configureStableNodeLayout(node) {
   resizeContentInput(resizeBaselineHeight);
   node._aipmFitContentInput = () => {
     if (!contentInput || !node.size) return;
-    const width = Number(node.size[0]) || AIPM_MIN_WIDTH;
-    const targetHeight = Number(node.size[1]) || resizeBaselineHeight;
-    const naturalHeight = Number(originalComputeSize?.call(node, [width, 0])?.[1]) || targetHeight;
-    const fittedHeight = Math.max(72, contentInput._aipmAdaptiveHeight + targetHeight - naturalHeight - 8);
-    contentInput._aipmAdaptiveHeight = fittedHeight;
-    contentBaselineHeight = fittedHeight;
-    resizeBaselineHeight = targetHeight;
-    resizeContentInput(targetHeight);
+    resizeContentInput(Number(node.size[1]));
   };
+
+  // Canvas arrange uses measured slot geometry, not computeSize. Fit against
+  // that exact budget before its overflow check can grow the node again.
+  const originalArrangeWidgets = node._arrangeWidgets;
+  if (contentInput && originalArrangeWidgets) {
+    node._arrangeWidgets = function (slotBottom) {
+      const start = this.widgets_start_y ?? ((this.widgets_up ? 0 : slotBottom) + 2);
+      const widgets = this.getLayoutWidgets();
+      let occupied = 4; // content widget margin
+      for (const widget of widgets) {
+        if (widget === contentInput) continue;
+        occupied += widget.computeSize
+          ? Number(widget.computeSize(this.size?.[0])?.[1] || 0) + 4
+          : widget.computeLayoutSize
+            ? Number(widget.computeLayoutSize(this).minHeight || 0)
+            : 24;
+      }
+      contentInput._aipmAdaptiveHeight = Math.max(72, this.bodyHeight - start - occupied - 8);
+      const element = contentInput.element || contentInput.inputEl;
+      if (element?.style) {
+        const height = `${Math.max(62, contentInput._aipmAdaptiveHeight - 10)}px`;
+        element.style.height = element.style.minHeight = element.style.maxHeight = height;
+      }
+      return originalArrangeWidgets.apply(this, arguments);
+    };
+  }
 
   const modification = node.widgets?.find((widget) =>
     widget.name === "修改意见" || widget.name === "遇到的问题与修改目标"
@@ -496,8 +526,7 @@ function migrateShiftedCachedResult(node) {
 function installGeneratePanel(node) {
   if (node._aipmGeneratePanel?.version === VERSION) return;
   removeOldPanel(node);
-  let running = false;
-  let currentAction = "generate";
+  const requestState = node._aipmRequestState ||= { running: false, activePromptId: "", pendingQueueEvents: [], currentAction: "generate" };
   const isRefinement = String(node?.comfyClass || node?.type || "") === "AIPMPromptRefinement";
   const isVideo = String(node?.comfyClass || node?.type || "") === "AIPMVideoPrompt";
   const isImage = String(node?.comfyClass || node?.type || "") === "AIPMImagePrompt";
@@ -566,8 +595,10 @@ function installGeneratePanel(node) {
   let run = async () => {};
   const button = keepRuntimeOnly(node.addWidget("button", isRefinement ? "分析并细化" : "生成 / 重新创作", null, () => run(false), { serialize: false }));
   const reviseButton = keepRuntimeOnly(node.addWidget("button", isRefinement ? "根据新意见继续细化" : "按修改意见优化", null, () => run(true), { serialize: false }));
-  const cacheButton = keepRuntimeOnly(node.addWidget("button", "输出缓存", null, () => {}, { serialize: false }));
-  const clearButton = keepRuntimeOnly(node.addWidget("button", "清空结果", null, () => {}, { serialize: false }));
+  // Some property panels capture the callback when addWidget registers it.
+  // Register the real handler immediately, not a placeholder replaced later.
+  const cacheButton = keepRuntimeOnly(node.addWidget("button", "输出缓存", null, outputCachedResult, { serialize: false }));
+  const clearButton = keepRuntimeOnly(node.addWidget("button", "清空结果", null, clearCachedResult, { serialize: false }));
   const status = keepRuntimeOnly(node.addWidget("text", "AIPM 状态", "仅执行当前节点，不触发工作流其他生成节点。", () => {}, { serialize: false }));
   const videoPromptPreview = isVideo && keepRuntimeOnly(node.addWidget(
     "text", "视频提示词预览", "", () => {},
@@ -646,13 +677,15 @@ function installGeneratePanel(node) {
     !isRefinement && cachedAuthoring()?.generation_status === "interrupted";
 
   const updateRevisionAvailability = () => {
-    const hasCache = Boolean(String(node.properties?.aipm_previous_result || "").trim());
+    const cachedText = String(node.properties?.aipm_previous_result || "").trim();
+    const hasCache = Boolean(cachedText);
+    cacheButton.name = hasCache ? `输出缓存（已有 ${cachedText.length} 字符）` : "输出缓存（无缓存）";
     // Native canvas widgets do not reliably repaint when `disabled` changes
     // after workflow cache restoration. Keep actions physically clickable and
     // let their callbacks explain missing prerequisites in the status widget.
     reviseButton.disabled = false;
     cacheButton.disabled = false;
-    if (!running && hasInterruptedVideo()) button.name = "继续生成";
+    if (!requestState.running && hasInterruptedVideo()) button.name = "继续生成";
     refreshSegmentTargets();
   };
 
@@ -718,11 +751,17 @@ function installGeneratePanel(node) {
       }
     }
     prompt.output = Object.fromEntries(Object.entries(apiNodes).filter(([id]) => keep.has(String(id))));
-    await app.api.queuePrompt(0, prompt);
+    const queued = await app.api.queuePrompt(0, prompt);
+    if (!queued?.prompt_id) throw new Error("AIPM提交未返回任务编号");
+    requestState.activePromptId = String(queued.prompt_id);
+    node.properties.aipm_pending_request = { id: requestState.activePromptId, action: requestState.currentAction };
+    const buffered = requestState.pendingQueueEvents;
+    requestState.pendingQueueEvents = [];
+    for (const [handler, event] of buffered) handler(event);
   };
 
   run = async (revise = false) => {
-    if (running) {
+    if (requestState.running) {
       setStatus("当前AIPM请求仍在执行，请等待完成；无需重复点击。", "");
       return;
     }
@@ -753,8 +792,10 @@ function installGeneratePanel(node) {
       setStatus("请选择要修改的分段。", "error");
       return;
     }
-    running = true;
-    currentAction = revise ? "revise" : (hasInterruptedVideo() ? "resume" : (
+    requestState.running = true;
+    requestState.activePromptId = "";
+    requestState.pendingQueueEvents = [];
+    requestState.currentAction = revise ? "revise" : (hasInterruptedVideo() ? "resume" : (
       isVideo && operationFromLabel(operationSelect.value) === "append" ? "append" : "generate"
     ));
     if (isVideo && modification) {
@@ -782,7 +823,7 @@ function installGeneratePanel(node) {
     }
     setStatus(revise
       ? "正在保留未修改内容并定向优化……"
-      : currentAction === "resume"
+      : requestState.currentAction === "resume"
         ? "正在从上次失败分段继续生成……"
         : "正在分析输入并生成专业提示词……");
     node.mode = 0;
@@ -792,7 +833,7 @@ function installGeneratePanel(node) {
     try {
       await queueCurrentOutputs();
     } catch (error) {
-      running = false;
+      requestState.running = false;
       button.disabled = false;
       reviseButton.disabled = false;
       cacheButton.disabled = false;
@@ -810,8 +851,8 @@ function installGeneratePanel(node) {
   };
   button.callback = () => run(false);
   reviseButton.callback = () => run(true);
-  cacheButton.callback = async () => {
-    if (running) {
+  async function outputCachedResult() {
+    if (requestState.running) {
       setStatus("当前AIPM请求仍在执行，请等待完成；无需重复点击。", "");
       return;
     }
@@ -825,8 +866,10 @@ function installGeneratePanel(node) {
       widget.name === "修改意见" || widget.name === "遇到的问题与修改目标"
     );
     const originalModification = String(modification?.value || "");
-    running = true;
-    currentAction = "cache";
+    requestState.running = true;
+    requestState.activePromptId = "";
+    requestState.pendingQueueEvents = [];
+    requestState.currentAction = "cache";
     if (previousResult) previousResult.value = cached;
     // Image/video nodes interpret a non-empty modification as a revision.
     // Refinement nodes can keep their issue text because their cached branch
@@ -840,7 +883,7 @@ function installGeneratePanel(node) {
     try {
       await queueCurrentOutputs();
     } catch (error) {
-      running = false;
+      requestState.running = false;
       button.disabled = false;
       reviseButton.disabled = false;
       cacheButton.disabled = false;
@@ -852,8 +895,8 @@ function installGeneratePanel(node) {
       node.mode = 0;
     }
   };
-  clearButton.callback = () => {
-    if (running) {
+  function clearCachedResult() {
+    if (requestState.running) {
       setStatus("当前AIPM请求仍在执行，完成后才能清空结果。", "");
       return;
     }
@@ -862,13 +905,45 @@ function installGeneratePanel(node) {
     );
     node.properties ||= {};
     node.properties.aipm_previous_result = "";
+    node.properties.aipm_target_segment_id = "";
     if (previousResult) previousResult.value = "";
+    if (videoPromptPreview) videoPromptPreview.value = "";
+    // Clear result displays only. The authored timeline is an independent
+    // document and must not be blanked through its connected STRING input.
+    const graph = node.graph || app.graph || app.rootGraph;
+    for (const source of node.outputs || []) {
+      for (const linkId of source?.links || []) {
+        const link = graph?.links?.[linkId] || graph?.links?.get?.(linkId);
+        const target = link ? graph?.getNodeById?.(link.target_id) : null;
+        const type = String(target?.type || target?.comfyClass || "").toLowerCase();
+        if (type.includes("showtext") || type.includes("displaytext") || type.includes("previewtext")) {
+          target.onExecuted?.({ text: [""] });
+          target.setDirtyCanvas?.(true, true);
+        }
+      }
+    }
     app.graph?.change?.();
     updateRevisionAvailability();
-    setStatus("已清空上次结果，下一次将重新创作。", "ok");
+    setStatus("已清空 AIPM 缓存与结果预览；时间轴内容保留。", "ok");
   };
 
+  // The Vue property panel turns callbacks into value updates; a button has
+  // no value, so the parent discards that update. Handle its forwarded DOM
+  // activation directly and stop the synthetic path to prevent duplicates.
+  for (const actionWidget of [button, reviseButton, cacheButton, clearButton]) {
+    actionWidget.options.onClickCapture = (event) => {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      actionWidget.callback?.();
+    };
+  }
+
   const acceptResult = (output) => {
+    // Only an explicit authoring/cache action may import a result. ComfyUI
+    // dispatches the same result through onExecuted and the websocket event;
+    // after the first acceptance requestState.running is false, so replay cannot overwrite
+    // subsequent edits or import cached results during segment generation.
+    if (!requestState.running || !Array.isArray(output?.text)) return;
     if (videoPromptPreview && output?.text?.[0] != null) {
       videoPromptPreview.value = String(output.text[0]);
       node.setDirtyCanvas?.(true, true);
@@ -876,6 +951,7 @@ function installGeneratePanel(node) {
     writeTextToLinkedPreviews(node, output);
     const raw = output?.text?.[2];
     let authoring = null;
+    let importError = "";
     if (raw) {
       node.properties ||= {};
       node.properties.aipm_previous_result = String(raw);
@@ -883,21 +959,29 @@ function installGeneratePanel(node) {
       authoring = cachedAuthoring();
       if (authoring?.generation_status !== "interrupted") {
         const resultOperation = String(authoring?.aipm_operation || "");
-        const writeStrategy = currentAction === "revise" || resultOperation === "revise_segment"
+        const writeStrategy = requestState.currentAction === "revise" || resultOperation === "revise_segment"
           ? "revise_segment"
-          : currentAction === "append" || resultOperation === "append"
+          : requestState.currentAction === "append" || resultOperation === "append"
             ? "append"
             : "rewrite";
-        writeResultToLinkedCineTimelines(
-          node, raw, writeStrategy,
-          String(node.properties?.aipm_target_segment_id || ""),
-        );
+        try {
+          const importedCount = writeResultToLinkedCineTimelines(
+            node, raw, writeStrategy,
+            String(node.properties?.aipm_target_segment_id || ""),
+          );
+          if (isVideo && importedCount === 0 && writeStrategy === "rewrite") {
+            throw new Error("未找到可接收结果的时间轴，请检查完整结果 JSON 连线与时间轴模式；结果已保留在 AIPM 缓存。");
+          }
+        } catch (error) {
+          importError = String(error?.message || error);
+        }
       }
     }
     app.graph?.change?.();
     updateRevisionAvailability();
-    if (!running) return;
-    running = false;
+    if (!requestState.running) return;
+    requestState.running = false;
+    delete node.properties.aipm_pending_request;
     button.disabled = false;
     reviseButton.disabled = false;
     cacheButton.disabled = false;
@@ -906,27 +990,72 @@ function installGeneratePanel(node) {
       ? "分析并细化"
       : authoring?.generation_status === "interrupted" ? "继续生成" : "生成 / 重新创作";
     reviseButton.name = isRefinement ? "根据新意见继续细化" : "按修改意见优化";
-    if (authoring?.generation_status === "interrupted") {
+    if (importError) {
+      setStatus(`结果已缓存，但未导入时间轴：${importError}`, "error");
+    } else if (authoring?.generation_status === "interrupted") {
       const next = Number(authoring?.resume_from_segment || 1);
       setStatus(`第 ${next} 段连续失败 2 次，已保留前面完成的分段；再次点击“继续生成”将从本段继续。`, "error");
-    } else setStatus(currentAction === "cache"
+    } else setStatus(requestState.currentAction === "cache"
       ? "缓存已重新输出，未调用远程服务。"
-      : currentAction === "revise"
+      : requestState.currentAction === "revise"
         ? "提示词优化完成，已保存为新的有效版本。"
-        : currentAction === "resume"
+        : requestState.currentAction === "resume"
           ? "剩余分段生成完成，已保存完整结果。"
-          : currentAction === "append"
+          : requestState.currentAction === "append"
             ? "续写分段已追加到AIPM缓存与已连接时间轴。"
           : "提示词生成完成，已保存为上次有效结果。", "ok");
   };
-  const executed = ({ detail }) => {
+  // Explicit recovery only: never import arbitrary history on page load.
+  const recoverHistory = async () => {
+    if (requestState.running) { setStatus("当前请求仍在跟踪，请等待结束。", ""); return; }
+    const id = globalThis.prompt("输入需要恢复的 AIPM 任务编号（不会调用远程服务）", node.properties?.aipm_pending_request?.id || "");
+    if (!id || !/^[0-9a-f-]{36}$/i.test(id.trim())) return;
+    try {
+      const response = await api.fetchApi("/history/" + encodeURIComponent(id.trim()));
+      if (!response.ok) throw new Error("读取任务历史失败");
+      const item = (await response.json())[id.trim()];
+      const original = item?.prompt?.[2]?.[String(node.id)];
+      const submitted = item?.prompt?.[3]?.extra_pnginfo?.workflow;
+      const graphId = (node.graph || app.graph)?.id;
+      if (original?.class_type !== "AIPMVideoPrompt" || submitted?.id !== graphId) {
+        throw new Error("任务不属于当前工作流的这个 AIPM 节点，未导入。");
+      }
+      const output = item?.outputs?.[String(node.id)];
+      if (!Array.isArray(output?.text) || !output.text[2]) throw new Error("任务尚无可恢复结果");
+      if (!globalThis.confirm("恢复此结果将替换当前连接时间轴的内容，继续吗？")) return;
+      requestState.activePromptId = id.trim();
+      requestState.currentAction = "generate";
+      requestState.running = true;
+      acceptResult(output);
+    } catch (error) {
+      requestState.running = false;
+      setStatus("恢复失败：" + String(error?.message || error), "error");
+    }
+  };
+  if (isVideo) {
+    const recoveryButton = keepRuntimeOnly(node.addWidget("button", "按任务编号恢复结果", null, recoverHistory, { serialize: false }));
+    recoveryButton.options.onClickCapture = event => {
+      event.preventDefault(); event.stopImmediatePropagation(); recoverHistory();
+    };
+  }
+  const scopeEvent = (callback) => {
+    const scoped = (event) => {
+      if (!requestState.running) return;
+      if (!requestState.activePromptId) {
+        if (requestState.pendingQueueEvents.length < 128) requestState.pendingQueueEvents.push([scoped, event]);
+        return;
+      }
+      if (String(event?.detail?.prompt_id || "") !== requestState.activePromptId) return;
+      callback(event);
+    };
+    return scoped;
+  };
+  const executed = scopeEvent(({ detail }) => {
     if (String(detail?.node ?? detail?.display_node ?? "") !== String(node.id)) return;
     acceptResult(detail?.output);
-  };
-  const failed = ({ detail }) => {
-    const failedNode = String(detail?.node_id ?? detail?.node ?? "");
-    if (!running || (failedNode && failedNode !== String(node.id))) return;
-    running = false;
+  });
+  const failed = scopeEvent(({ detail }) => {
+    requestState.running = false;
     button.disabled = false;
     reviseButton.disabled = false;
     cacheButton.disabled = false;
@@ -935,17 +1064,17 @@ function installGeneratePanel(node) {
     reviseButton.name = isRefinement ? "根据新意见继续细化" : "按修改意见优化";
     updateRevisionAvailability();
     setStatus(`生成失败：${detail?.exception_message || detail?.message || "请查看执行错误"}`, "error");
-  };
-  const completedWithoutNodeResult = () => {
+  });
+  const completedWithoutNodeResult = scopeEvent(() => {
     setTimeout(() => {
-      if (!running) return;
-      running = false;
+      if (!requestState.running) return;
+      requestState.running = false;
       button.disabled = false;
       clearButton.disabled = false;
       updateRevisionAvailability();
       setStatus("本次队列已经结束，但没有收到新的AIPM结果；按钮已自动恢复，请检查任务队列或再次提交。", "error");
     }, 0);
-  };
+  });
   api.addEventListener("executed", executed);
   api.addEventListener("execution_error", failed);
   api.addEventListener("execution_success", completedWithoutNodeResult);
@@ -954,14 +1083,15 @@ function installGeneratePanel(node) {
   const originalNodeExecuted = node.onExecuted;
   const nodeExecuted = function (output) {
     const result = originalNodeExecuted?.apply(this, arguments);
-    acceptResult(output);
+    // This callback has no prompt_id. The scoped websocket handler is the
+    // authoritative importer, so callbacks from another queue cannot replay data.
     return result;
   };
   node.onExecuted = nodeExecuted;
   const originalSerialize = node.onSerialize;
   const serialize = function () {
-    if (previousResult && String(this.properties?.aipm_previous_result || "").trim()) {
-      previousResult.value = String(this.properties.aipm_previous_result);
+    if (previousResult && Object.prototype.hasOwnProperty.call(this.properties || {}, "aipm_previous_result")) {
+      previousResult.value = String(this.properties.aipm_previous_result || "");
     }
     return originalSerialize?.apply(this, arguments);
   };

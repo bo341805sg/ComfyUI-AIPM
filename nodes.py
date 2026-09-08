@@ -18,6 +18,51 @@ from PIL import Image
 
 CATEGORY = "AI 提示词大师"
 
+
+def requires_planned_dialogue(idea: str) -> bool:
+    """Conservative lexical guard, not a full natural-language intent parser.
+
+    Remove local negative speech phrases, not entire sentences: a request may
+    forbid narration while still requiring a character's line.
+    """
+    speech = r"(?:台词|对白|旁白|独白|对话|开口|说一句|说话)"
+    text = re.sub(
+        rf"(?:不要|不需要|无需|禁止|没有|无|不)(?:任何|添加|加入|生成|安排|出现|进行|让角色|角色|人物|人声|的|\s)*{speech}",
+        "", idea,
+    )
+    text = re.sub(
+        r"\b(?:no|without|avoid|do not add|don't add)\s+(?:any\s+)?(?:dialogue|voice[ -]?over|speech|speaking)\b",
+        "", text, flags=re.IGNORECASE,
+    )
+    return bool(re.search(
+        speech + r"|dialogue|voice[ -]?over|\bspeak\b|\bsays?\b|(?:说|问|答)[：:“\"]",
+        text, re.IGNORECASE,
+    ))
+
+
+def explicitly_allows_repeated_segments(idea: str) -> bool:
+    # A mere mention of repetition (especially a prohibition) is not consent.
+    text = re.sub(r"(?:不要|禁止|避免|不允许|无需)(?:完全|再次|再|任何|\s)*(?:重复|循环)[^，。；\n]*", "", idea)
+    text = re.sub(r"\b(?:do not|don't|never|avoid)\s+(?:repeat|loop)[^,.;\n]*", "", text, flags=re.IGNORECASE)
+    return bool(re.search(
+        r"(?:明确要求|要求|需要|请)(?:两段|每段|都|完全|再次|\s)*(?:重复|循环)"
+        r"|(?:重复演示|循环演示|循环播放)|\b(?:please repeat|repeat the same|loop the same)\b",
+        text, re.IGNORECASE,
+    ))
+
+
+def normalize_plan_mode(plan: dict[str, Any], mode: str) -> None:
+    """Frame placements are executable only in keyframe mode.
+
+    Preserve reference identities and descriptions; discard only inapplicable
+    frame-routing fields so multimodal portraits cannot become timed guides.
+    """
+    if mode == "h3_ref2va":
+        for segment in plan.get("segments", []):
+            if isinstance(segment, dict):
+                segment["keyframe_bindings"] = []
+                segment["keyframe_transitions"] = []
+
 # This menu represents prompt dialects, not product versions. Models sharing
 # the same prompting rules intentionally live in one family.
 IMAGE_MODEL_PROFILES = [
@@ -178,6 +223,17 @@ NATIVE_QUALITY_ANCHORS = {
 SKILLS_DIR = Path(__file__).resolve().parent / "skills"
 
 
+def load_h3_planning_review() -> str:
+    """Planner-only guidance, never an additional model-output schema."""
+    path = SKILLS_DIR / "aipm-minimax-h3-video" / "references" / "planning-review.md"
+    if not path.is_file():
+        raise PromptAssistantError(f"MiniMax H3 规划检查规则不存在：{path}")
+    text = path.read_text(encoding="utf-8").strip()
+    if not text:
+        raise PromptAssistantError("MiniMax H3 规划检查规则为空")
+    return text
+
+
 def load_prompt_skill(model_profile: str, mode: str | None = None) -> tuple[str, str]:
     skill_id = (
         "aipm-prompt-refinement" if str(model_profile) == "__refinement__" else
@@ -201,7 +257,11 @@ def load_prompt_skill(model_profile: str, mode: str | None = None) -> tuple[str,
         if not reference_text:
             raise PromptAssistantError(f"MiniMax H3 模式规则为空：{reference_name}")
         text = f"{text}\n\n{reference_text}"
-    return skill_id, text
+    contract_path = SKILLS_DIR / "runtime-contract.md"
+    contract = contract_path.read_text(encoding="utf-8").strip()
+    if not contract:
+        raise PromptAssistantError("AIPM运行边界规则为空")
+    return skill_id, f"{contract}\n\n{text}"
 
 
 def resolve_prompt_language(model_profile: str, requested: str) -> str:
@@ -420,7 +480,12 @@ class ReferenceAnalysisPipeline:
         profiles: list[dict[str, Any]] = []
         cache_hits = 0
         for index, image in enumerate(images):
-            cache_key = f"{service_model}:{image['sha256']}"
+            # Analysis is conditioned on the service, task and reference slot,
+            # not just pixels. Reordered references must not reuse old roles.
+            cache_key = hashlib.sha256(json.dumps(
+                ["image-analysis-v2", service_url, service_model, image["sha256"],
+                 index + 1, role_hint], ensure_ascii=False,
+            ).encode("utf-8")).hexdigest()
             analysis = cls._image_cache.get(cache_key)
             if analysis:
                 cache_hits += 1
@@ -481,7 +546,7 @@ class AIPMImagePrompt:
         return {
             "required": {
                 "画面描述与创作要求": ("STRING", {"default": "", "multiline": True, "dynamicPrompts": False}),
-                "远程服务地址": ("STRING", {"default": "http://192.168.10.27:8080/v1"}),
+                "远程服务地址": ("STRING", {"default": "http://127.0.0.1:8080/v1"}),
                 "模型名称": ("STRING", {"default": "Huihui-Qwen3.8-27B-abliterated-Q5_K.gguf"}),
                 "目标生图模型": (IMAGE_MODEL_PROFILES, {"default": "Krea 2 / Krea 2 Turbo 文生图"}),
                 "画面比例": (["自动", "1:1", "16:9", "9:16", "4:3", "3:4", "21:9"],),
@@ -531,7 +596,7 @@ class AIPMVideoPrompt:
         return {
             "required": {
                 "视频内容与导演要求": ("STRING", {"default": "", "multiline": True, "dynamicPrompts": False}),
-                "远程服务地址": ("STRING", {"default": "http://192.168.10.27:8080/v1"}),
+                "远程服务地址": ("STRING", {"default": "http://127.0.0.1:8080/v1"}),
                 "模型名称": ("STRING", {"default": "Huihui-Qwen3.8-27B-abliterated-Q5_K.gguf"}),
                 "目标视频模型": (VIDEO_MODEL_PROFILES,),
                 "生成模式": (["多模态", "关键帧"], {"default": "多模态"}),
@@ -803,10 +868,8 @@ class AIPMVideoPrompt:
         ), -1)
         if operation == "revise_segment" and target_index < 0:
             raise PromptAssistantError("修改目标分段不在AIPM缓存中")
-        dialogue_requested = bool(re.search(
-            r"台词|对白|旁白|独白|对话|开口|说一句|说话|dialogue|voice[ -]?over|\bspeak\b|\bsays?\b",
-            idea, re.IGNORECASE,
-        ))
+        dialogue_requested = requires_planned_dialogue(idea)
+        repeated_segments_allowed = explicitly_allows_repeated_segments(idea)
         reference_ids = [item["picture_id"] for item in reference_profiles]
         image_reference_ids = list(reference_ids)
         video_count = int(has_video or 0)
@@ -831,6 +894,7 @@ class AIPMVideoPrompt:
             "default_segment_duration": duration_seconds, "target_model": profile,
             "mode": mode, "aspect_ratio": aspect_ratio, "language": requested_language,
             "timeline_fps": 24,
+            "planning_review": load_h3_planning_review(),
             "reference_profiles": reference_profiles, "available_reference_ids": reference_ids,
             "previous_result": previous, "modification_request": modification if previous else "",
             "timeline_operation": operation,
@@ -846,7 +910,8 @@ class AIPMVideoPrompt:
                 "若没有共同人物服装场景，全局只保留画面风格、画质、色彩、摄影语言、声音规范和公共负向约束",
                 "每个分段只列本段额外需要的参考；不得把未使用参考塞入全局",
                 f"必须准确输出 {segment_count} 个分段，每段默认 {duration_seconds} 秒",
-                "多段时每段必须推进不同的剧情阶段；brief、opening_state、ending_state不得与其他分段三项全部相同，禁止把完整创作要求原样复制到每一段",
+                "默认每段推进不同剧情，禁止把完整要求复制到每段；用户明确要求重复演示或循环时保留重复，其他情况下brief、opening_state、ending_state不得三项全同",
+                "多模态模式keyframe_bindings和keyframe_transitions必须为空；人物/道具参考不等于指定帧位",
                 "若创作要求提出需要台词、对白、旁白或角色说话，但没有给出逐字文本，必须结合人物关系、情境、目标和时长主动创作简洁可表演的台词，并在对应分段计划中明确台词内容与说话者；若用户给出逐字台词，则必须原样保留",
                 "每个分段的dialogue_lines必须列出本段实际发声内容，格式为‘角色：逐字台词’；没有任何发声时返回空数组，禁止用‘包含对白’‘角色说话’等占位描述",
                 "transition表示进入本段的边界：全新时间轴第一段必须为cut；续写的第一段必须根据现有最后一段决定cut或motion_context；只有动作、机位运动、构图尺度和声音相位都应从上一段无缝延续时才用motion_context",
@@ -885,7 +950,8 @@ class AIPMVideoPrompt:
                 for line in (segment.get("dialogue_lines") or [])
             ):
                 raise PromptAssistantError("创作要求需要台词，但时间线规划没有产出任何实际台词正文")
-            if segment_count > 1:
+            normalize_plan_mode(candidate, mode)
+            if segment_count > 1 and not repeated_segments_allowed:
                 signatures = [
                     tuple(re.sub(r"\s+", "", str(segment.get(field) or "")) for field in (
                         "brief", "opening_state", "ending_state",
@@ -967,6 +1033,7 @@ class AIPMVideoPrompt:
                 } for index in range(segment_count)],
             }
             plan_response = {"usage": {}, "aipm_fallback": "local_timeline_plan"}
+        normalize_plan_mode(plan, mode)
         segments_plan = plan.get("segments") if isinstance(plan.get("segments"), list) else []
         if len(segments_plan) != segment_count:
             raise PromptAssistantError(f"时间线规划应返回 {segment_count} 段，实际返回 {len(segments_plan)} 段")
@@ -1583,7 +1650,7 @@ class AIPMPromptRefinement:
             "提示词类型": (["自动判断", "生图提示词", "生视频提示词"], {"default": "自动判断"}),
             "目标模型": (REFINEMENT_MODEL_PROFILES, {"default": "自动判断 / 通用（推荐）"}),
             "必须保留的内容": ("STRING", {"default": "", "multiline": True, "dynamicPrompts": False}),
-            "远程服务地址": ("STRING", {"default": "http://192.168.10.27:8080/v1"}),
+                "远程服务地址": ("STRING", {"default": "http://127.0.0.1:8080/v1"}),
             "模型名称": ("STRING", {"default": "Huihui-Qwen3.8-27B-abliterated-Q5_K.gguf"}),
             "输出语言": (["跟随原提示词（推荐）", "中文", "English"],),
         }, "optional": {
@@ -1675,7 +1742,7 @@ class AIPMImagePrompt:
         return {
             "required": {
                 "画面描述与创作要求": ("STRING", {"default": "", "multiline": True, "dynamicPrompts": False}),
-                "远程服务地址": ("STRING", {"default": "http://192.168.10.27:8080/v1"}),
+                "远程服务地址": ("STRING", {"default": "http://127.0.0.1:8080/v1"}),
                 "模型名称": ("STRING", {"default": "Huihui-Qwen3.8-27B-abliterated-Q5_K.gguf"}),
                 "目标生图模型": (IMAGE_MODEL_PROFILES, {"default": "Krea 2 / Krea 2 Turbo 文生图"}),
                 "画面比例": (["自动", "1:1", "16:9", "9:16", "4:3", "3:4", "21:9"],),
@@ -1697,8 +1764,8 @@ class AIPMImagePrompt:
                 "positive_prompt": {"type": "string"}, "negative_prompt": {"type": "string"},
                 "composition_notes": {"type": "string"},
                 "reference_usage": {"type": "array", "items": {"type": "string"}},
-                "quality_features": {"type": "array", "items": {"type": "string"}, "minItems": 4},
-                "emphasis_features": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+                "quality_features": {"type": "array", "items": {"type": "string"}},
+                "emphasis_features": {"type": "array", "items": {"type": "string"}},
             }, "required": ["positive_prompt", "negative_prompt", "composition_notes", "reference_usage", "quality_features", "emphasis_features"],
         }}}
 
@@ -1914,9 +1981,9 @@ class AIPMImagePrompt:
         native_quality_anchor = NATIVE_QUALITY_ANCHORS.get(model_profile, "")
         numeric_weight_skills = {"aipm-sd-weighted", "aipm-pony-booru", "aipm-illustrious-booru"}
         emphasis_policy = (
-            "必须在正向提示词中对 1–3 个真正关键的主体、动作或道具使用温和权重；推荐范围 1.1–1.3，禁止全词加权。"
+            "优先用清楚语序表达重点；仅当前工作流支持且确有必要时使用少量温和权重，不强制加权。"
             if prompt_skill_id in numeric_weight_skills else
-            "禁止数字权重；必须通过句首、主句、对焦、光线对比和细节密度突出 1–3 个重点。"
+            "禁止数字权重；用清楚主句突出任务重点，不强加对焦或光线设计。"
         )
         resolved_language = resolve_prompt_language(model_profile, str(提示词语言))
         if resolved_language == "zh-CN":
@@ -1949,8 +2016,8 @@ class AIPMImagePrompt:
                     "此模型不强制固定质量口令；仅当专业技能或目标 checkpoint 模型卡明确要求时使用质量标签，禁止无依据堆叠 score、masterpiece 或 8K。"
                 ),
                 "emphasis": emphasis_policy,
-                "quality": "正向提示词必须显式包含至少 4 个与当前画面相关、可见且具体的画质/渲染特征，不得只写高质量、8K、masterpiece。",
-                "coverage": ["主体身份与视觉重点", "动作/表情/手势", "构图与镜头", "光线与色彩", "材质与表面响应", "焦点、解剖与细节完成度"],
+                "quality": "只补充任务相关、可见的画质特征，不凑数量，不改变已有参考内容；极简画面可以不补充。",
+                "coverage": "按任务需要选择主体、动作、构图、光色和材质；无关项省略，不为覆盖清单制造内容。",
                 "audit": "quality_features 和 emphasis_features 必须逐项列出已实际写进 positive_prompt 的短语；不得列出正文中不存在的项目。",
             },
             "modification_request": modification if previous else "",
@@ -1966,8 +2033,8 @@ class AIPMImagePrompt:
                 "不臆造看不清的身份事实，不把分析过程写进正向提示词",
                 "针对目标生图模型优化表达，但不添加该模型不支持的参数语法",
                 "修改模式下只改变修改意见明确涉及的内容，其余人物、场景、构图和参考关系保持稳定",
-                "不得只对用户描述做同义改写；必须执行 professional_skill，主动补足专业画质、主体重点、构图、镜头、光线、色彩和材质设计",
-                "mandatory_professional_contract 是硬性验收标准；缺少任一 coverage、画质不足 4 项或重点策略未落实都不得提交",
+                "依据professional_skill补足影响执行的视觉细节；简单任务不为扩写而新增对象、材质或镜头。保持用户主体、数量、动作和风格不变",
+                "遵守本次任务与输出结构；quality_features、emphasis_features只列正文已使用的相关短语，可为空，禁止为凑数扩写",
             ],
         }
         # The synthesis request is deliberately text-only. Each image has
