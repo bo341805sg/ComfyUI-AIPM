@@ -1,10 +1,10 @@
 import { app } from "../../../scripts/app.js";
 import { api } from "../../../scripts/api.js";
 
-if (!globalThis.__COMFYUI_AIPM_UI_VERSION__ || globalThis.__COMFYUI_AIPM_UI_VERSION__ < 83) {
-  globalThis.__COMFYUI_AIPM_UI_VERSION__ = 83;
+if (!globalThis.__COMFYUI_AIPM_UI_VERSION__ || globalThis.__COMFYUI_AIPM_UI_VERSION__ < 85) {
+  globalThis.__COMFYUI_AIPM_UI_VERSION__ = 85;
 
-const VERSION = 83;
+const VERSION = 85;
 const AIPM_MIN_WIDTH = 480;
 const REVISION_MARKER = "__AIPM_REVISION_V1__";
 const RUN_MARKER = "__AIPM_RUN_V1__";
@@ -80,6 +80,25 @@ function writeTextToLinkedPreviews(node, output) {
     }
   }
   return updated;
+}
+
+function linkedAppendTimeline(node) {
+  const graph = node.graph || app.graph;
+  const output = (node.outputs || []).find(o => o.name === "完整结果 JSON");
+  const targets = new Set();
+  for (const id of output?.links || []) {
+    const link = graph?.links?.[id] || graph?.links?.get?.(id);
+    const target = link && graph.getNodeById?.(link.target_id);
+    if (target && ["CineTimelinePlan", "CineTimelineKeyframePlan", "CineTimelineStudio", "CineTimelineEditor"].includes(target.comfyClass || target.type)
+        && target.inputs?.[link.target_slot]?.name === "timeline_json") targets.add(target);
+  }
+  if (!targets.size) return null;
+  if (targets.size !== 1) throw new Error("续写连接了多个时间轴，请只保留一个目标。");
+  const target = [...targets][0];
+  const widget = target.widgets?.find(w => w.name === "timeline_state");
+  const timeline = JSON.parse(String(widget?.value || "{}"));
+  if (!Array.isArray(timeline.shots) || !timeline.shots.length) throw new Error("当前时间轴没有可续写分段。");
+  return timeline;
 }
 
 function writeResultToLinkedCineTimelines(node, rawTimelineJson, strategy = "rewrite", targetSegmentId = "") {
@@ -689,7 +708,7 @@ function installGeneratePanel(node) {
     refreshSegmentTargets();
   };
 
-  const queueCurrentOutputs = async () => {
+  const queueCurrentOutputs = async (requestInputs = {}) => {
     // Queue direct text-preview consumers as execution endpoints. This keeps
     // prompt assistants independent from the expensive generation chain.
     const activeGraph = node.graph || app.graph || app.rootGraph;
@@ -751,6 +770,15 @@ function installGeneratePanel(node) {
       }
     }
     prompt.output = Object.fromEntries(Object.entries(apiNodes).filter(([id]) => keep.has(String(id))));
+    // Private execution markers belong only to the API payload, never widgets
+    // or the workflow snapshot. Resolve exactly one node; fail closed if ambiguous.
+    const requestClass = String(node.comfyClass || node.type || "");
+    const matches = Object.entries(prompt.output).filter(([id, entry]) =>
+      entry.class_type === requestClass &&
+      (id === String(node.id) || id.endsWith(`:${node.id}`))
+    );
+    if (matches.length !== 1) throw new Error("无法唯一定位AIPM请求节点，未提交。");
+    matches[0][1].inputs = { ...matches[0][1].inputs, ...requestInputs };
     const queued = await app.api.queuePrompt(0, prompt);
     if (!queued?.prompt_id) throw new Error("AIPM提交未返回任务编号");
     requestState.activePromptId = String(queued.prompt_id);
@@ -776,6 +804,7 @@ function installGeneratePanel(node) {
       widget.name === "修改意见" || widget.name === "遇到的问题与修改目标"
     );
     const originalModification = String(modification?.value || "");
+    let requestModification = originalModification;
     if (revise && !String(modification?.value || "").trim()) {
       setStatus("请先填写修改意见。", "error");
       return;
@@ -792,6 +821,11 @@ function installGeneratePanel(node) {
       setStatus("请选择要修改的分段。", "error");
       return;
     }
+    let editorTimeline = null;
+    if (isVideo && !revise && operationFromLabel(operationSelect.value) === "append") {
+      try { editorTimeline = linkedAppendTimeline(node); }
+      catch (error) { setStatus(String(error.message || error), "error"); return; }
+    }
     requestState.running = true;
     requestState.activePromptId = "";
     requestState.pendingQueueEvents = [];
@@ -799,19 +833,20 @@ function installGeneratePanel(node) {
       isVideo && operationFromLabel(operationSelect.value) === "append" ? "append" : "generate"
     ));
     if (isVideo && modification) {
-      modification.value = "__AIPM_RUN_V2__" + JSON.stringify({
+      requestModification = "__AIPM_RUN_V2__" + JSON.stringify({
         operation: revise ? "revise_segment" : operationFromLabel(operationSelect.value),
         target_segment_id: revise ? (targetIdsByLabel.get(String(targetSelect.value)) || "") : "",
         instruction: originalModification,
         previous_result: String(node.properties?.aipm_previous_result || ""),
+        editor_timeline: editorTimeline,
       });
     } else if (revise && modification) {
-      modification.value = REVISION_MARKER + JSON.stringify({
+      requestModification = REVISION_MARKER + JSON.stringify({
         instruction: originalModification,
         previous_result: String(node.properties?.aipm_previous_result || ""),
       });
     } else {
-      if (modification) modification.value = isRefinement
+      if (modification) requestModification = isRefinement
         ? `${RUN_MARKER}${originalModification}`
         : `${RUN_MARKER}${Date.now()}`;
       // Preserve an interrupted video package as a resumable checkpoint.
@@ -831,7 +866,7 @@ function installGeneratePanel(node) {
       node.widgets.splice(Math.min(previousResultIndex, node.widgets.length), 0, previousResult);
     }
     try {
-      await queueCurrentOutputs();
+      await queueCurrentOutputs(modification ? { [modification.name]: requestModification } : {});
     } catch (error) {
       requestState.running = false;
       button.disabled = false;
@@ -845,7 +880,7 @@ function installGeneratePanel(node) {
     } finally {
       // The revision field is user-authored working text. Keep it after every
       // submission so the user can refine or reuse the same instruction.
-      if (modification) modification.value = originalModification;
+      // Do not restore widgets: the user may have edited them during submission.
       node.mode = 0;
     }
   };
@@ -874,14 +909,14 @@ function installGeneratePanel(node) {
     // Image/video nodes interpret a non-empty modification as a revision.
     // Refinement nodes can keep their issue text because their cached branch
     // is selected whenever no independent execution marker is present.
-    if (modification && !isRefinement) modification.value = "";
+    const requestInputs = modification && !isRefinement ? { [modification.name]: "" } : {};
     setStatus("正在从本地缓存重新输出，不调用远程服务……");
     node.mode = 0;
     if (previousResult && !node.widgets?.includes(previousResult)) {
       node.widgets.splice(Math.min(previousResultIndex, node.widgets.length), 0, previousResult);
     }
     try {
-      await queueCurrentOutputs();
+      await queueCurrentOutputs(requestInputs);
     } catch (error) {
       requestState.running = false;
       button.disabled = false;
@@ -891,7 +926,7 @@ function installGeneratePanel(node) {
       updateRevisionAvailability();
       setStatus(`缓存输出失败：${describeSubmissionError(error)}`, "error");
     } finally {
-      if (modification) modification.value = originalModification;
+      // User-authored modification text is never changed for cache output.
       node.mode = 0;
     }
   };

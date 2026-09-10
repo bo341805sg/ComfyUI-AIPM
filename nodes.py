@@ -534,6 +534,77 @@ class ReferenceAnalysisPipeline:
         return profiles, cache_hits
 
 
+def reconcile_append_editor(package, timeline):
+    """Use the connected editor's current order/content, never resurrect deleted shots."""
+    if not isinstance(timeline, dict) or not isinstance(timeline.get("shots"), list):
+        raise PromptAssistantError("续写时间轴快照无效")
+    shots = timeline["shots"]
+    if not shots:
+        raise PromptAssistantError("当前时间轴没有分段，请先生成初始剧情")
+    cached = {str(s.get("segment_id")): s for s in package.get("segments", [])}
+    result = copy.deepcopy(package)
+    segments, seen = [], set()
+    fps = float(timeline.get("fps") or 24)
+    if fps <= 0:
+        raise PromptAssistantError("时间轴帧率无效")
+    for shot in shots:
+        sid = str(shot.get("shot_id") or "")
+        if not sid or sid in seen:
+            raise PromptAssistantError("时间轴分段编号为空或重复")
+        seen.add(sid)
+        segment = copy.deepcopy(cached.get(sid, {}))
+        metadata = shot.get("metadata") or {}
+        duration = (float(shot["end_frame"]) - float(shot["start_frame"])) / fps
+        if duration <= 0:
+            raise PromptAssistantError("时间轴分段时长无效")
+        segment.update(segment_id=sid, index=len(segments)+1, duration=duration,
+                       title=shot.get("title") or segment.get("title") or sid,
+                       transition=shot.get("transition", "cut"))
+        if "local_prompt" in shot:
+            for key in ("timeline_local_prompt", "source_prompt", "prompt", "compiled_prompt"):
+                segment[key] = str(shot["local_prompt"] or "")
+        for source, target in (("start_state", "opening_state"), ("end_state", "ending_state"),
+                               ("handoff", "continuity_from_previous"), ("dialogue_lines", "dialogue_lines")):
+            if source in metadata: segment[target] = copy.deepcopy(metadata[source])
+        segments.append(segment)
+    result.update(segments=segments, segment_count=len(segments),
+                  total_duration=sum(s["duration"] for s in segments),
+                  generation_status="complete", aipm_operation="rewrite")
+    for key in ("append_base_count", "append_requested_count", "resume_from_segment", "failed_segment_id", "interruption_error"):
+        result.pop(key, None)
+    return result
+
+
+def reuse_append_global_images(profiles, base_package, mode):
+    """Reuse proven global asset identities; retain distinct temporal roles.
+
+    image_sha256 identifies the analyzed image, unlike loader slots or filenames.
+    Unknown/ambiguous identities fail closed to a fresh, collision-free ordinal.
+    """
+    old = [p for p in base_package.get("reference_profiles", []) if isinstance(p, dict)]
+    global_ids = set(base_package.get("global", {}).get("reference_ids", []))
+    occupied = {str(p.get("picture_id") or "") for p in old}
+    matches = {}
+    for p in old:
+        digest = str(p.get("image_sha256") or "").strip().lower()
+        pid = str(p.get("picture_id") or "")
+        if digest and pid in global_ids:
+            matches.setdefault(digest, set()).add(pid)
+    next_id = 1
+    for p in profiles:
+        digest = str(p.get("image_sha256") or "").strip().lower()
+        candidates = matches.get(digest, set()) if mode == "h3_ref2va" else set()
+        if len(candidates) == 1:
+            p["picture_id"] = next(iter(candidates))
+        else:
+            while f"<Picture {next_id}>" in occupied:
+                next_id += 1
+            p["picture_id"] = f"<Picture {next_id}>"
+            occupied.add(p["picture_id"])
+            next_id += 1
+    return profiles
+
+
 class AIPMImagePrompt:
     CATEGORY = CATEGORY
     FUNCTION = "generate"
@@ -861,7 +932,8 @@ class AIPMVideoPrompt:
     ):
         base_package = copy.deepcopy(base_package) if isinstance(base_package, dict) else None
         base_segments = copy.deepcopy(base_package.get("segments") or []) if base_package else []
-        append_offset = len(base_segments) if operation == "append" else 0
+        append_offset = max([len(base_segments)] + [int(m.group(1)) for s in base_segments
+                            if (m := re.fullmatch(r"SEGMENT_(\d+)", str(s.get("segment_id") or "")))]) if operation == "append" else 0
         target_index = next((
             index for index, item in enumerate(base_segments)
             if str(item.get("segment_id") or "") == str(target_segment_id or "")
@@ -900,6 +972,7 @@ class AIPMVideoPrompt:
             "timeline_operation": operation,
             "existing_segments": [{
                 "segment_id": item.get("segment_id"), "title": item.get("title"),
+                "prompt": item.get("timeline_local_prompt") or item.get("source_prompt") or item.get("prompt"),
                 "opening_state": item.get("opening_state"), "ending_state": item.get("ending_state"),
                 "transition": item.get("transition", "cut"),
             } for item in base_segments],
@@ -1360,6 +1433,9 @@ class AIPMVideoPrompt:
                 operation = str(run_payload.get("operation") or "rewrite")
                 target_segment_id = str(run_payload.get("target_segment_id") or "")
                 previous_json = str(run_payload.get("previous_result") or previous_json or "")
+                if operation == "append" and run_payload.get("editor_timeline") is not None:
+                    stored = self._authoring_data(json.loads(previous_json))
+                    previous_json = json.dumps(reconcile_append_editor(stored, run_payload["editor_timeline"]), ensure_ascii=False)
                 modification = str(run_payload.get("instruction") or "").strip()
             except (json.JSONDecodeError, AttributeError) as exc:
                 raise PromptAssistantError("AIPM时间轴操作请求无效") from exc
@@ -1483,21 +1559,13 @@ class AIPMVideoPrompt:
         for index, profile_item in enumerate(reference_profiles):
             if index < len(image_assets):
                 profile_item.update(image_assets[index])
-        if operation == "append" and base_package:
-            # Each append submission's connected loaders describe the new
-            # segment. Provider ordinals must continue after the cached image
-            # profiles; reusing <Picture 1..N> would resolve the appended shot
-            # back to the first segment's assets when packages are merged.
-            old_profiles = base_package.get("reference_profiles")
-            old_profiles = old_profiles if isinstance(old_profiles, list) else []
-            picture_offset = len(old_profiles)
-            for index, item in enumerate(reference_profiles, 1):
-                item["picture_id"] = f"<Picture {picture_offset + index}>"
         # AIPM currently targets one H3 family; the separate generation-mode
         # widget owns the keyframe vs multimodal distinction.  Normalize old
         # persisted profile labels without changing their chosen mode.
         profile = "MiniMax H3"
         mode = self._resolve_mode(profile, str(生成模式), len(reference_profiles), bool(connected_video_count), bool(connected_audio_count))
+        if operation == "append" and base_package:
+            reuse_append_global_images(reference_profiles, base_package, mode)
         if mode != "h3_ref2va" and (connected_video_count or connected_audio_count):
             raise PromptAssistantError("只有多模态模式接受视频或声音参考；其他模式仅按顺序绑定参考图片")
         if mode == "h3_fl2va" and len(reference_profiles) > 2:
@@ -2195,6 +2263,7 @@ class AIPMCineTimelineAdapter:
             )
             shots.append({
                 "shot_id": shot_id, "start_frame": start, "end_frame": end,
+                "title": str(segment.get("title") or ""),
                 "local_prompt": local_prompt,
                 "camera": "", "transition": "cut" if index == 0 else (
                     str(segment.get("transition") or 默认转场)

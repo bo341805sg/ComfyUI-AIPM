@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased — 2026-09-10
+
+- Keep generation/revision request JSON in the API payload, never in the visible modification widget. Preserve edits made while a request is pending.
+- For a directly connected CineTimeline append, use the editor's current shot order, surviving shots, titles and prompts. Standalone AIPM continues using its own cache.
+- Allocate new segment IDs after the largest surviving ordinal, so deletion and reordering cannot collide with appended segments.
+- Reuse matching global image identities during multimodal append; preserve separate local and keyframe roles.
+- Pass segment titles into the CineTimeline adapter.
+- Retain the 1.3.0 planning, skill and reference-analysis cache safeguards. Local server addresses and personal workflows are not included.
+
 ## 1.3.0 — 2026-09-08
 
 - Refine image and video skill instructions: preserve explicit intent and reference roles, avoid irrelevant detail quotas, and separate stage-specific output contracts.
