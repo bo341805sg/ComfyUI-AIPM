@@ -14,7 +14,7 @@
 - FLUX.1 文生图、FLUX.2 文生图与多参考编辑。
 - Qwen Image 文生图、单图编辑与多图编辑。
 - SD/SDXL、SD3、Pony、Illustrious/NoobAI 等模型方言。
-- 最多九张生图参考图的逐图分析、`image1` 至 `image9` 有序绑定和职责校验。
+- 最多三张生图参考图的逐图分析、`image1/image2/image3` 有序绑定和完整职责校验。
 - MiniMax H3 T2VA、I2VA、L2VA、FL2VA、Ref2VA，以及 Wan、LTX-Video、HunyuanVideo 专用技能。
 - 多分段视频提示词、台词/说话人、声音、摄影、表演、连续性与 CineTimeline JSON 输出。
 - 多段生成按段保存检查点；单段连续失败 2 次后中断，再次点击从失败段继续，完整完成后再次生成才从头开始。
@@ -23,8 +23,6 @@
 ## 远程服务
 
 服务需兼容 `POST /v1/chat/completions`。需要鉴权时设置环境变量 `AIPM_API_KEY`；密钥不会写入工作流。
-
-新节点默认地址为 `http://127.0.0.1:8080/v1`，请按实际服务配置地址和模型名称。更新记录见 [CHANGELOG.md](CHANGELOG.md)，测试范围与已知限制见 [验证记录](tests/RELEASE-VALIDATION.md)。
 
 ## 安装
 
@@ -36,8 +34,19 @@
 python -m unittest discover -s tests -v
 ```
 
-当前回归测试：52 项。
+当前 Python 回归测试：90 项。
 
 ## License
 
 MIT
+
+
+## 全局服务连接（2026-10-21）
+
+在 ComfyUI 设置 → AIPM → 服务 → 连接，统一填写服务地址（含 `/v1`）、模型 ID 与 API Key，点击“保存 AIPM 连接”。所有图片、视频、细化节点共用，不再显示这两个服务输入框。保存后后续请求生效。
+
+配置保存在 ComfyUI 用户目录 `default/AIPM/connection.json`（本机明文文件，勿分享）；密钥不写入工作流、不返回浏览器。密钥输入留空保留原值，勾选“清除”才删除本地值；未配置本地密钥时仍兼容 `AIPM_API_KEY` / `PROMPT_ASSISTANT_API_KEY`。旧工作流的地址和模型参数会在载入时移除，统一连接设置优先。升级后重启后端并完整刷新页面；API脚本提交须省略旧服务参数。
+
+## 2026-10-22 H3 提示词更新
+
+H3 合约版本 `2026-10-22.1`：默认保持连续单镜头，保留明确切镜和有意省略；补充跨镜头动作、持物、接触、声音连续性和参考保留等级规则。按任务只选取对应模式与示例，减少上下文占用。

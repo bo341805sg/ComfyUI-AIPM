@@ -1,3 +1,9 @@
+# 2026-10-22
+
+- Global service URL, model ID and API key settings; migrate legacy node widgets.
+- H3 contract validation and task-specific skill examples.
+- Continuity, explicit cuts, dialogue and reference-retention rules.
+
 # Changelog
 
 ## Unreleased — 2026-09-10

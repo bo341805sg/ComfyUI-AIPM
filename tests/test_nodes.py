@@ -116,7 +116,7 @@ class PromptAssistantTests(unittest.TestCase):
         _, ref = nodes.load_prompt_skill("MiniMax H3 Ref2VA（多参考）", "h3_ref2va")
         self.assertNotIn("Two-speaker example fragment", image)
         self.assertNotIn("Two-speaker example fragment", base)
-        self.assertIn("Two-speaker example fragment", ref)
+        self.assertIn("reference generation", nodes._h3_contract.selected_example(ROOT / "skills" / "aipm-minimax-h3-video", "h3_ref2va", "人物对白")[1])
         self.assertNotIn("AIPM 分段与素材检查（仅用于规划请求）", ref)
 
     def test_h3_planning_review_missing_or_empty_fails_explicitly(self):
@@ -147,14 +147,12 @@ class PromptAssistantTests(unittest.TestCase):
         self.assertEqual(purpose[0], ["多参考改图", "仅分析参考"])
         self.assertEqual(purpose[1]["default"], "多参考改图")
 
-    def test_both_nodes_expose_editable_model_name_with_huihui_default(self):
-        expected = "Huihui-Qwen3.8-27B-abliterated-Q5_K.gguf"
-        for node in (nodes.AIPMImagePrompt, nodes.AIPMVideoPromptCore):
+    def test_connection_fields_are_global(self):
+        for node in (nodes.AIPMImagePrompt, nodes.AIPMVideoPrompt, nodes.AIPMPromptRefinement):
             required = node.INPUT_TYPES()["required"]
-            self.assertIn("模型名称", required)
+            self.assertNotIn("模型名称", required)
+            self.assertNotIn("远程服务地址", required)
             self.assertNotIn("服务模型", required)
-            self.assertEqual(required["模型名称"][0], "STRING")
-            self.assertEqual(required["模型名称"][1]["default"], expected)
 
     def test_description_editor_uses_native_multiline_widget(self):
         ui = (ROOT / "web" / "aipm_ui.js").read_text(encoding="utf-8")
@@ -940,7 +938,7 @@ class PromptAssistantTests(unittest.TestCase):
         def fake_text(cls, *args, **kwargs):
             calls.append(args[2])
             index = len(calls)
-            return (f"integrated_multimodal_description: [Shot 1] 第{index}段使用中文描述人物动作、镜头、表演、声音与结束状态，内容足够完整清晰。\n\noverall_soundscape: 环境声。\n\nnon_diegetic_music: N/A", {"usage": {"total_tokens": 7}})
+            return (f"subject_definitions:\n<Subject 1> 是 <Picture 1> 中的人物。\nsummary:\nreference generation. 当前分段。\nretention_analysis:\n<Subject 1> 的身份为 fully_preserved。\ndetailed_description: [Shot 1] 第{index}段使用中文描述人物动作、镜头、表演、声音与结束状态，内容足够完整清晰。\n\noverall_soundscape: 环境声。\n\nnon_diegetic_music: N/A", {"usage": {"total_tokens": 7}})
         nodes.OpenAICompatibleClient.request_text = classmethod(fake_text)
         try:
             result = node.generate_timeline_package(
@@ -982,7 +980,7 @@ class PromptAssistantTests(unittest.TestCase):
         )
         nodes.OpenAICompatibleClient.request_text = classmethod(
             lambda cls, *args, **kwargs: (
-                "integrated_multimodal_description: [Shot 1] 人物完成当前阶段动作并稳定落定，镜头清晰连续。\n\n"
+                "subject_definitions:\n<Subject 1> 是 <Picture 1> 中的人物。\nsummary:\nreference generation. 当前阶段。\nretention_analysis:\n<Subject 1> 的身份为 fully_preserved。\ndetailed_description: [Shot 1] 人物完成当前阶段动作并稳定落定，镜头清晰连续。\n\n"
                 "overall_soundscape: 环境声。\n\nnon_diegetic_music: N/A", {"usage": {}}
             )
         )

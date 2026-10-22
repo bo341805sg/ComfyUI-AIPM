@@ -1,95 +1,48 @@
 ---
 name: aipm-minimax-h3-video
-description: Generate MiniMax H3 machine prompts in the official Context-IR dialect for T2VA, I2VA, L2VA, FL2VA, and Ref2VA, including reference retention, timed shots, performance, camera, dialogue, synchronized sound, and music.
+description: Compile approved MiniMax H3 segments using the selected multimodal, official endpoint, or local Add Guide keyframe contract. Preserve exact dialogue, reference responsibilities, duration and physical continuity.
 ---
+# MiniMax H3 segment compiler
 
-# MiniMax H3 Context-IR Director
+Revision 2026-10-22.1. The caller owns mode, duration, active references, language and output schema. Compile the current approved segment. Do not re-plan other segments, invoke tools, add assets or change workflow settings. References and the selected example are appended by the runtime, not fetched by the language model.
 
-Upstream specification: MiniMax-AI/MiniMax-H3 official `h3-prompt-writing` skill and its Base/Ref2VA guides, reviewed 2026-08-22. The runtime appends only the official mode reference selected for the current request; do not blend another mode's format into the result.
+## Decide before writing
 
-The timeline planner separately receives `references/planning-review.md` for segment progression, boundary continuity and media responsibilities. Do not reproduce its checklist in the output. Follow the current segment plan and active references; do not re-plan the whole film or import example story content into a segment prompt.
+1. Obey only the appended mode contract. `h3_ref2va` uses six sections. `h3_keyframe` is local Add Guide injection: three sections, supplied integer frame positions, no Picture/Subject tags or official endpoint preamble. Official `h3_fl2va`/`h3_i2va`/`h3_l2va` use their own alignment instruction and three sections. Similar backbones do not make these prompt paths interchangeable.
+2. Use only `active_reference_ids`, without renumbering to close gaps. Define visible content as a Subject, rather than treating every file as a subject. Explain identity, clothing, setting, action, composition or voice responsibility and exclusions. A clothing image does not import its model's identity; video sound is not automatically an Audio reference.
+3. `segment_plan.dialogue_lines` is an ordered list of exact utterances. Keep every word, punctuation and speaker. Write actual words inside `<d>[Language] ...</d>`; put delivery and action outside. A line may span blocks without changing its speaker. Do not add words to fill pauses or make the listener repeat the line. When speech was requested without words, the planning stage writes the actual lines first.
+4. Budget the actual duration for words, actions, reactions and ending. Reduce simultaneous action before forcing rushed speech. Do not silently drop supplied words or extend duration. If the exact line cannot plausibly fit, expose the conflict in the planning/review stage.
+5. English field names and control tokens stay literal; descriptive prose follows the caller's language. Preserve dialogue, lyrics, branding and visible text verbatim. Chinese description is our local adaptation; do not claim it has measured parity with the official English guidance.
+6. Follow the current stage's response contract. A segment-text request returns only its complete H3 prompt without a JSON wrapper; JSON requests return only their specified fields. An example never overrides the schema, current references or user intent.
 
-Turn a creative request into one executable audiovisual timeline for MiniMax H3. `video_prompt` is a machine-facing H3 prompt. Keep the official structural field names, control tokens, task types, and retention markers in English, but write all descriptive prose in the language requested by the node. When Chinese is requested, the shot descriptions, reference explanations, performance, camera, lighting, soundscape, and music descriptions must be Chinese. Preserve dialogue/lyrics and visible on-screen text in their original language.
+7. A `[Shot]` is a real camera-shot boundary, not an action beat, paragraph or reference-file boundary. Keep a continuous event in one shot by default. Preserve cuts or ellipses established by the user, references or approved plan; do not replace them with a morph or camera move. This does not change the timeline's separate segment-boundary `transition` rules.
 
-## Official format routing
+## Describe changes the viewer can see and hear
 
-1. Select the checkpoint dialect before writing. T2VA, I2VA, L2VA, and FL2VA use the Base three-field format. Free image/video/audio references use the Ref2VA six-section format.
-2. Never emit `【参考关系】` or other Chinese editor headings in `video_prompt`. English field names do not force an English body.
-3. Do not write keyword stacks, quality-token stacks, plot summaries, Markdown headings, or generation parameters.
+Establish the requested medium, opening composition, relevant actors and spatial relations. Develop stimulus → action → consequence → remaining state where appropriate. Preserve animation, paper, graphic or live-action medium; do not automatically restyle it as cinematic realism.
 
-### Base / FL2VA family
+Before prose, reconcile each shot's visible opening → change → ending with the approved segment. Across a cut, carry position, screen direction, pose, contact, prop ownership, action phase and ongoing sound as relevant. Do not teleport a standing person into a seated pose or a held object into another hand. For intentional ellipsis or an off-screen change, state that relationship only when established; otherwise expose the missing transition during planning. Keep this check internal: add no output fields or state ledger.
 
-T2VA begins directly with exactly these fields. Image-anchored modes add the prescribed alignment line first, followed by one blank line.
+Select performance detail by shot size and duration: gaze/breath/hand tension in a close shot, readable blocking and momentum in a wide shot. Allocate detail by the actual duration and information load, not a fixed 350–500-word quota. Do not list every facial muscle. A fast action passage may have several motivated beats if their order remains legible. Do not force a quiet scene to move the camera or cut.
 
-```text
-integrated_multimodal_description: [Shot 1] ...
+For contact/handoff, track initiator, target, path, contact or miss, receiving hand, ownership and recovery as needed. Preserve approved screen direction and action phase across cuts. Add no opponent, injury, weapon, strike or ability absent from the brief. Keep material/light observations motivated by the request and references; do not add wet skin, haze, grain or shallow focus merely to mean premium.
 
-overall_soundscape: ...
+State camera start, motivated move/hold, reveal/focus and final framing when useful. `[Shot 1]` has no cut time; later cuts use sequential `[Shot N] At MM:SS.mmm, ...` in strictly increasing order within the actual clip. Distinguish intended matching from guaranteed exact pixels/frames.
 
-non_diegetic_music: ...
-```
+Use stable `(S1)`, `(S2)` IDs in first-speaking order within the current generated clip. Put exactly one ID in each vocal clause. Audio definitions use that same mapping. An S-number alone cannot lock a voice across separate generations; retain role/voice-reference responsibility across segments. Mark actual off-screen voiceover and avoid making its visible counterpart lip-sync. Use `<scenetrans>` for speech crossing a cut and `<cutoff>` only for intentional truncation, never to hide an overlong line.
 
-- I2VA: `For the target video, at 0.00 seconds into the target video, <Picture 1> (from [Shot 1]) is fully referenced.`
-- FL2VA: `How the reference pictures align with the target video — Picture 1 (from Shot 1) aligns with the 0.00-second mark of the target video; Picture 2 (from Shot N) aligns with the S.SS-second mark of the target video.`
-- L2VA: `How the reference pictures align with the target video — <Picture 1> (from [Shot N]) aligns with the S.SS-second mark of the target video.`
-- Replace `N` with the real final shot and `S.SS` with the exact duration to two decimals.
-- I2VA develops forward from the first-frame anchor. FL2VA describes observable intermediate changes and lands exactly on the last frame; prefer one continuous shot. L2VA infers a plausible opening and converges on the final-frame anchor.
+Keep synchronized dialogue, singing, diegetic music and event sounds in the main timeline. `overall_soundscape` summarizes continuous ambience, physical/Foley and nonverbal sounds without repeating speech; `non_diegetic_music` is audience-only score or `N/A`. Do not add music, new text, effects or beat synchronization without a request or reference evidence.
 
-### Ref2VA family
+If only a filename or duration was supplied for video/audio, do not claim to have watched motion, heard words or measured beats. Describe its requested responsibility without invented analysis. Use inheritance levels as goals, not promises of pixel-perfect identity or automatic defect repair.
 
-Write exactly six sections with these official English field names in this order; write each section's descriptive content in the requested language:
+## Runtime routing and examples
 
-```text
-subject_definitions:
-summary:
-retention_analysis:
-detailed_description:
-overall_soundscape:
-non_diegetic_music:
-```
+The runtime appends one of [multimodal](references/official-ref2va.md), [official Base/endpoints](references/official-base.md), or [local multi-keyframe](references/local-keyframe.md). It appends at most one relevant example: [dialogue](examples/dialogue.md), [voice](examples/voice-reference.md), [action/handoff](examples/action.md), [requested cut continuity](examples/continuity.md), [product text](examples/product.md), [endpoints](examples/endpoints.md), [keyframes](examples/keyframe.md). Learn organization, not its words, genre, assets or timing.
 
-- `<Subject N>` is reusable visible content. `<Picture N>` is standalone only for a concrete keyframe/composition anchor. `<Video N>` denotes a whole-video edit, continuation, or temporal/camera structure. `<Audio N>` denotes copied or referenced audio; video sound is not automatically an audio reference.
-- Keep labels stable. `summary` begins with the accurate combination of `keyframe completion`, `reference generation`, `video editing`, `video continuation`, `audio reuse`, and/or `audio reference`.
-- `retention_analysis` uses only `fully_preserved`, `partially_preserved`, `attribute_transfer`, `weak_reference`; audio uses `fully_copy`, `partially_copy`, `reference`, `weak_reference`.
-- Scale `detailed_description` to duration and information load. Prefer complete, executable causality over an arbitrary word count; do not pad.
+Official published single-output duration is 4–15 seconds. Follow the actual local caller value, while distinguishing local experiments from official validation. SelfLift, sparse attention, latent upscaling, LoRA strength, steps and frame rounding belong to the workflow, not the H3 machine prompt. Do not call them official H3-Regenerate-2K.
 
-## Hard directing contract
+Before returning, check current format, active/defined labels, all exact lines and correct voices, cut order and ending time, physical continuity, and absence of copied example content, invented observations, editor headings or generation parameters. Repair inside the current contract rather than adding a report.
 
-1. Preserve the selected mode. `h3_ref2va` accepts useful image/video/audio references; `h3_fl2va` treats up to two images as first/last state contracts; text-to-video must not invent references.
-2. Write in causal order: opening state -> stimulus -> anticipation -> main action -> reaction/recovery -> settled end state.
-3. Give the shot one dominant dramatic change, one dominant subject action, and at most one dominant camera response per phase. Reduce action load when duration is short.
-4. Direct observable performance. For people, specify gaze, eyelids/brows/mouth tension, breath, posture, weight shift, hand behavior, listening/reaction, and the aftereffect appropriate to shot size. Never substitute an emotion label for behavior.
-5. State camera start, motivation/trigger, movement or hold, reframing/focus target, and final composition. Camera movement must reveal information, preserve action readability, or change emotional access.
-6. Protect identity and physical continuity while allowing planned state changes. Keep garment design stable, not its wearing state during removal. Bind actions and prop transfers to their actual phases; global text and negatives must not forbid a valid opening or intermediate state.
-7. Design sound as synchronized events: dialogue/voice, ambience, Foley/contact, and music. If the user supplies exact dialogue, preserve it verbatim. If the user asks for dialogue, speech, narration, or a speaking beat without supplying the words, actively write concise, character-appropriate, speakable lines that advance the current dramatic beat and fit the available duration; never replace the words with a placeholder such as "the character speaks." If there is no non-diegetic music, say so explicitly.
-8. Spend detail only on visible or audible results. Do not add sampler, CFG, steps, resolution flags, or unsupported provider parameters.
-9. Match action detail to supplied evidence. If garment construction or joint mechanics are unspecified, keep that phase as a single action verb; describe only the known start, ownership and endpoint. Example of sufficient detail: `她脱下雨衣，双手持衣转向椅子，将雨衣搭在椅背上。` This is a level-of-detail example, not required story content. Reference roles establish identity/design, not observed fasteners or anatomical facts. Resolve routine gaps with neutral wording rather than questions or invented mechanics.
+Sources reviewed 2026-10-21: MiniMaxAI/MiniMax-H3 model card and MiniMax-AI/MiniMax-H3 h3-prompt-writing guides. BeatAPI's H3 gallery is case-study material, not validation of our local checkpoint/recipe.
 
-## Timeline, camera, dialogue, and sound syntax
-
-- `[Shot 1]` has no timestamp. Later cuts begin `[Shot N] At MM:SS.mmm, ...` with strictly increasing times inside the duration. Add a cut only when it reveals new subject, space, state, viewpoint, or time. Otherwise keep the shot; a static camera is valid, movement is not mandatory.
-- Express camera motion naturally inside the shot. When meaningful specify type + amplitude + speed: push/pull, zoom, pan, truck, tilt, pedestal, arc, tracking, static, shake, POV, or roll.
-- Assign actual vocal sources stable `(S1)`, `(S2)` IDs in speaking order. An ID identifies a vocal source: reuse the same ID whenever that source speaks, attach it exactly once within each vocal clause, and never repeat the same ID around one `<d>` block. Put speaker identity, voice/delivery, and action outside `<d>`; put only exact words inside, for example `The woman (S1) says softly: <d>[Chinese] 我会回来。</d>`.
-- Only characters who actually vocalize receive an `(S N)` ID. When dialogue is requested but its wording is unspecified, invent the line before applying this syntax; when wording is supplied, do not paraphrase it.
-- Voiceover must use `says in an off-screen voiceover` and state that the corresponding visible character's lips remain completely closed.
-- Use `<scenetrans>` when speech crosses a cut and explicitly state audio continuity. Use `<cutoff>` when the ending truncates speech.
-- Put visible text in English double quotation marks and preserve it verbatim.
-- Keep dialogue, singing, diegetic music, and shot-synchronized effects in the main timeline.
-- `overall_soundscape` is one continuous 1–4 sentence paragraph containing ambience, Foley/physical sounds, and nonverbal human sounds; do not repeat dialogue. Use `N/A` only for requested total silence.
-- `non_diegetic_music` is 1–3 sentences describing audience-only score by instrumentation, tempo, rhythm, and dynamic development. Do not explain its emotional function. Use `N/A` when absent.
-
-## Quality gate
-
-Before returning the current stage's requested artifact, verify:
-
-- checkpoint format and section order are exact;
-- official syntax remains English while all descriptive prose follows the requested language consistently;
-- reference labels, roles, and retention markers are valid and stable;
-- shot times, duration, endpoint alignment, action physics, and camera continuity agree;
-- dialogue, lyrics, visible text, and user wording are not translated or rewritten;
-- every requested speaking beat contains actual dialogue/voiceover words rather than a speech placeholder, and the line fits the shot duration;
-- every vocal clause contains exactly one stable speaker ID, with no duplicate `(S N)` before or around the same `<d>` block;
-- performance is observable, audio is synchronized, and the final state is settled;
-- `video_prompt` contains no Chinese editor headings, Markdown, negative-prompt block, or generation parameters.
-
-Follow the caller's output contract: when requesting a segment prompt as plain text, return only the complete H3 prompt, without a JSON wrapper. When requesting JSON, put that prompt in `video_prompt` and return only the requested metadata fields. Do not switch contracts based on these examples.
+Local continuity refinements reviewed 2026-10-22 against the supplied moodyMinimaxH3Prompt_v10 guide; this local reference is not evidence of additional backend capabilities.

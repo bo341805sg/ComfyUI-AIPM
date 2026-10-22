@@ -249,7 +249,7 @@ def load_prompt_skill(model_profile: str, mode: str | None = None) -> tuple[str,
     if not text:
         raise PromptAssistantError(f"目标提示词技能为空：{skill_id}")
     if skill_id == "aipm-minimax-h3-video" and mode:
-        reference_name = "official-ref2va.md" if mode == "h3_ref2va" else "official-base.md"
+        reference_name = "official-ref2va.md" if mode == "h3_ref2va" else "local-keyframe.md" if mode == "h3_keyframe" else "official-base.md"
         reference_path = skill_path.parent / "references" / reference_name
         if not reference_path.is_file():
             raise PromptAssistantError(f"MiniMax H3 模式规则不存在：{reference_path}")
@@ -287,10 +287,7 @@ class OpenAICompatibleClient:
     @classmethod
     def request(cls, service_url: str, payload: dict[str, Any], timeout: float = 300.0) -> dict[str, Any]:
         headers = {"Content-Type": "application/json", "User-Agent": "ComfyUI-AIPM/0.1"}
-        api_key = (
-            os.getenv("AIPM_API_KEY", "").strip()
-            or os.getenv("PROMPT_ASSISTANT_API_KEY", "").strip()
-        )
+        api_key = _connection_settings.api_key_for(service_url)
         if api_key:
             headers["Authorization"] = "Bearer " + api_key
         request = urllib.request.Request(
@@ -534,77 +531,6 @@ class ReferenceAnalysisPipeline:
         return profiles, cache_hits
 
 
-def reconcile_append_editor(package, timeline):
-    """Use the connected editor's current order/content, never resurrect deleted shots."""
-    if not isinstance(timeline, dict) or not isinstance(timeline.get("shots"), list):
-        raise PromptAssistantError("续写时间轴快照无效")
-    shots = timeline["shots"]
-    if not shots:
-        raise PromptAssistantError("当前时间轴没有分段，请先生成初始剧情")
-    cached = {str(s.get("segment_id")): s for s in package.get("segments", [])}
-    result = copy.deepcopy(package)
-    segments, seen = [], set()
-    fps = float(timeline.get("fps") or 24)
-    if fps <= 0:
-        raise PromptAssistantError("时间轴帧率无效")
-    for shot in shots:
-        sid = str(shot.get("shot_id") or "")
-        if not sid or sid in seen:
-            raise PromptAssistantError("时间轴分段编号为空或重复")
-        seen.add(sid)
-        segment = copy.deepcopy(cached.get(sid, {}))
-        metadata = shot.get("metadata") or {}
-        duration = (float(shot["end_frame"]) - float(shot["start_frame"])) / fps
-        if duration <= 0:
-            raise PromptAssistantError("时间轴分段时长无效")
-        segment.update(segment_id=sid, index=len(segments)+1, duration=duration,
-                       title=shot.get("title") or segment.get("title") or sid,
-                       transition=shot.get("transition", "cut"))
-        if "local_prompt" in shot:
-            for key in ("timeline_local_prompt", "source_prompt", "prompt", "compiled_prompt"):
-                segment[key] = str(shot["local_prompt"] or "")
-        for source, target in (("start_state", "opening_state"), ("end_state", "ending_state"),
-                               ("handoff", "continuity_from_previous"), ("dialogue_lines", "dialogue_lines")):
-            if source in metadata: segment[target] = copy.deepcopy(metadata[source])
-        segments.append(segment)
-    result.update(segments=segments, segment_count=len(segments),
-                  total_duration=sum(s["duration"] for s in segments),
-                  generation_status="complete", aipm_operation="rewrite")
-    for key in ("append_base_count", "append_requested_count", "resume_from_segment", "failed_segment_id", "interruption_error"):
-        result.pop(key, None)
-    return result
-
-
-def reuse_append_global_images(profiles, base_package, mode):
-    """Reuse proven global asset identities; retain distinct temporal roles.
-
-    image_sha256 identifies the analyzed image, unlike loader slots or filenames.
-    Unknown/ambiguous identities fail closed to a fresh, collision-free ordinal.
-    """
-    old = [p for p in base_package.get("reference_profiles", []) if isinstance(p, dict)]
-    global_ids = set(base_package.get("global", {}).get("reference_ids", []))
-    occupied = {str(p.get("picture_id") or "") for p in old}
-    matches = {}
-    for p in old:
-        digest = str(p.get("image_sha256") or "").strip().lower()
-        pid = str(p.get("picture_id") or "")
-        if digest and pid in global_ids:
-            matches.setdefault(digest, set()).add(pid)
-    next_id = 1
-    for p in profiles:
-        digest = str(p.get("image_sha256") or "").strip().lower()
-        candidates = matches.get(digest, set()) if mode == "h3_ref2va" else set()
-        if len(candidates) == 1:
-            p["picture_id"] = next(iter(candidates))
-        else:
-            while f"<Picture {next_id}>" in occupied:
-                next_id += 1
-            p["picture_id"] = f"<Picture {next_id}>"
-            occupied.add(p["picture_id"])
-            next_id += 1
-    return profiles
-
-
 class AIPMImagePrompt:
     CATEGORY = CATEGORY
     FUNCTION = "generate"
@@ -617,8 +543,6 @@ class AIPMImagePrompt:
         return {
             "required": {
                 "画面描述与创作要求": ("STRING", {"default": "", "multiline": True, "dynamicPrompts": False}),
-                "远程服务地址": ("STRING", {"default": "http://127.0.0.1:8080/v1"}),
-                "模型名称": ("STRING", {"default": "Huihui-Qwen3.8-27B-abliterated-Q5_K.gguf"}),
                 "目标生图模型": (IMAGE_MODEL_PROFILES, {"default": "Krea 2 / Krea 2 Turbo 文生图"}),
                 "画面比例": (["自动", "1:1", "16:9", "9:16", "4:3", "3:4", "21:9"],),
                 "提示词语言": (["自动适配（推荐）", "中文", "English"],),
@@ -667,8 +591,6 @@ class AIPMVideoPrompt:
         return {
             "required": {
                 "视频内容与导演要求": ("STRING", {"default": "", "multiline": True, "dynamicPrompts": False}),
-                "远程服务地址": ("STRING", {"default": "http://127.0.0.1:8080/v1"}),
-                "模型名称": ("STRING", {"default": "Huihui-Qwen3.8-27B-abliterated-Q5_K.gguf"}),
                 "目标视频模型": (VIDEO_MODEL_PROFILES,),
                 "生成模式": (["多模态", "关键帧"], {"default": "多模态"}),
                 "视频时长": ("INT", {"default": 15, "min": 4, "max": 30, "step": 1, "display": "number"}),
@@ -802,87 +724,17 @@ class AIPMVideoPrompt:
 
     @staticmethod
     def validate_h3_structure(prompt: str, mode: str, duration_seconds: int) -> None:
-        """Reject structurally invalid H3 prompts before they enter CineTimeline."""
-        text = str(prompt or "").strip()
-        base_fields = [
-            "integrated_multimodal_description", "overall_soundscape", "non_diegetic_music",
-        ]
-        ref_fields = [
-            "subject_definitions", "summary", "retention_analysis", "detailed_description",
-            "overall_soundscape", "non_diegetic_music",
-        ]
-        expected = ref_fields if mode == "h3_ref2va" else base_fields
-        found = re.findall(
-            r"(?m)^(subject_definitions|summary|retention_analysis|detailed_description|"
-            r"integrated_multimodal_description|overall_soundscape|non_diegetic_music)\s*:", text,
-        )
-        if found != expected:
-            raise PromptAssistantError(
-                f"MiniMax H3 {mode} 字段结构错误：应为 {' -> '.join(expected)}，实际为 {' -> '.join(found) or '无'}"
-            )
-        if "【" in text or "】" in text:
-            raise PromptAssistantError("MiniMax H3 机器提示词不能包含中文方括号编辑标签")
-        for minutes, seconds, millis in re.findall(r"At\s+(\d{2}):(\d{2})\.(\d{3})", text):
-            timestamp = int(minutes) * 60 + int(seconds) + int(millis) / 1000
-            if timestamp < 0 or timestamp > duration_seconds:
-                raise PromptAssistantError(
-                    f"镜头时间 {minutes}:{seconds}.{millis} 必须位于 0 至 {duration_seconds} 秒的闭区间内"
-                )
+        try:
+            _h3_contract.validate_structure(prompt, mode, duration_seconds)
+        except _h3_contract.ContractError as exc:
+            raise PromptAssistantError(str(exc)) from exc
 
     @staticmethod
     def bind_dialogue_speaker_ids(prompt: str, dialogue_lines: list[str]) -> str:
-        """Deterministically bind one stable speaker ID to each H3 vocal event."""
-        roles = [
-            re.split(r"[：:]", str(line), maxsplit=1)[0].strip()
-            for line in dialogue_lines if str(line).strip()
-        ]
-        if not roles:
-            return prompt
-        role_ids: dict[str, int] = {}
-        for role in roles:
-            if role not in role_ids:
-                role_ids[role] = len(role_ids) + 1
-        dialogue_pattern = re.compile(r"<d>\s*\[[^\]]+\]\s*.+?</d>", re.DOTALL)
-        matches = list(dialogue_pattern.finditer(prompt))
-        if not matches:
-            return prompt
-
-        output: list[str] = []
-        cursor = 0
-        for dialogue_index, match in enumerate(matches):
-            role = roles[min(dialogue_index, len(roles) - 1)]
-            speaker = f"(S{role_ids[role]})"
-            between = prompt[cursor:match.start()]
-
-            # A speaker ID belongs to the current vocal clause, not necessarily
-            # immediately next to <d>.  Keep its first occurrence and remove only
-            # duplicate occurrences of the same ID in that clause.  Strong sentence
-            # boundaries keep IDs from an earlier vocal event out of consideration.
-            boundary = max(
-                between.rfind(marker)
-                for marker in ("。", "！", "？", "\n", "<scenetrans>", "<cutoff>")
-            )
-            head, clause = between[:boundary + 1], between[boundary + 1:]
-            occurrences = list(re.finditer(re.escape(speaker), clause))
-            if occurrences:
-                first_seen = False
-
-                def deduplicate(current: re.Match[str]) -> str:
-                    nonlocal first_seen
-                    if not first_seen:
-                        first_seen = True
-                        return current.group(0)
-                    return ""
-
-                clause = re.sub(re.escape(speaker), deduplicate, clause)
-            else:
-                clause = f"{clause}{speaker} "
-
-            output.extend((head, clause, match.group(0)))
-            cursor = match.end()
-
-        output.append(prompt[cursor:])
-        return "".join(output)
+        try:
+            return _h3_contract.bind_dialogue(prompt, dialogue_lines)
+        except _h3_contract.ContractError as exc:
+            raise PromptAssistantError(str(exc)) from exc
 
     @staticmethod
     def compile_h3_prompt(local_prompt: str, global_prompt: str, negative_prompt: str) -> str:
@@ -932,8 +784,7 @@ class AIPMVideoPrompt:
     ):
         base_package = copy.deepcopy(base_package) if isinstance(base_package, dict) else None
         base_segments = copy.deepcopy(base_package.get("segments") or []) if base_package else []
-        append_offset = max([len(base_segments)] + [int(m.group(1)) for s in base_segments
-                            if (m := re.fullmatch(r"SEGMENT_(\d+)", str(s.get("segment_id") or "")))]) if operation == "append" else 0
+        append_offset = len(base_segments) if operation == "append" else 0
         target_index = next((
             index for index, item in enumerate(base_segments)
             if str(item.get("segment_id") or "") == str(target_segment_id or "")
@@ -949,7 +800,7 @@ class AIPMVideoPrompt:
         reference_ids.extend(f"<Video {index}>" for index in range(1, video_count + 1))
         reference_ids.extend(f"<Audio {index}>" for index in range(1, audio_count + 1))
         resume_key = hashlib.sha256(json.dumps({
-            "service_model": service_model, "profile": profile, "mode": mode,
+            "service_model": service_model, "profile": profile, "mode": mode, "h3_contract_version": _h3_contract.VERSION,
             "idea": idea, "duration_seconds": duration_seconds,
             "segment_count": segment_count, "aspect_ratio": aspect_ratio,
             "requested_language": requested_language,
@@ -972,7 +823,6 @@ class AIPMVideoPrompt:
             "timeline_operation": operation,
             "existing_segments": [{
                 "segment_id": item.get("segment_id"), "title": item.get("title"),
-                "prompt": item.get("timeline_local_prompt") or item.get("source_prompt") or item.get("prompt"),
                 "opening_state": item.get("opening_state"), "ending_state": item.get("ending_state"),
                 "transition": item.get("transition", "cut"),
             } for item in base_segments],
@@ -993,6 +843,7 @@ class AIPMVideoPrompt:
                 "规划内容精炼，禁止在规划JSON里撰写完整H3提示词",
             ],
         }
+        plan_context["h3_planning_rules"] = _h3_contract.planning_rules()
         if mode == "h3_keyframe":
             frame_count = max(1, round(duration_seconds * 24))
             plan_context["keyframe_rules"] = [
@@ -1063,14 +914,18 @@ class AIPMVideoPrompt:
                 plan, plan_response = OpenAICompatibleClient.request_object(
                     service_url, plan_payload, "时间线规划", attempts=3, validator=validate_plan,
                 )
-        except PromptAssistantError:
+        except PromptAssistantError as exc:
+            if dialogue_requested:
+                raise PromptAssistantError("含对白的时间线规划失败；为避免漏句或错绑说话者，未使用空台词回退，请重试规划。") from exc
+            import logging
+            logging.warning("AIPM H3规划降级：使用本地占位规划，保留原风格和文字，请复核分段、素材与帧位。")
             # Small local fallback: some llama.cpp JSON-schema backends truncate
             # even a one-segment planning object. Planning is only routing data;
             # the professional segment prompt is still authored by the remote
             # model in the next stage, so do not abort the whole workflow here.
             plan = {
-                "global_prompt": "电影级写实质感、稳定主体身份与空间连续性、自然光影、清晰细节",
-                "global_negative_prompt": "低清晰度、闪烁、重影、身份漂移、畸形肢体、文字、水印",
+                "global_prompt": "",
+                "global_negative_prompt": "",
                 "global_reference_ids": reference_ids if segment_count == 1 else [],
                 "global_reference_bindings": [],
                 "segments": [{
@@ -1179,7 +1034,7 @@ class AIPMVideoPrompt:
                 "rules": [
                     "输出纯文本，不输出JSON、Markdown或解释",
                     "只写当前分段的局部H3提示词，不重复global_prompt中的公共风格、人物、服装、场景或声音规范；全局内容将由本地编译器合并",
-                    "只使用active_reference_ids中的参考，并保持官方Subject/Picture/Video/Audio语法",
+                    "只使用active_reference_ids中的参考；多模态保持Subject/Picture/Video/Audio语法，Add Guide关键帧模式只描述帧位",
                     f"本段严格为{duration_seconds}秒，结尾状态必须落定",
                     "中文模式下只有官方字段、标签和枚举为英文，所有描述正文使用中文",
                     "若segment_plan或创作要求需要台词、对白、旁白或角色说话，必须写出实际可朗读的台词正文，不能只写‘角色说话’或仅描述音色；未指定原文时主动根据剧情创作，已指定原文时逐字保留",
@@ -1194,6 +1049,13 @@ class AIPMVideoPrompt:
                     "按segment_plan.keyframe_transitions逐区间描述相邻图片之间连续、物理可行的画面变化过程，不能只罗列静态图片",
                     "关键帧图片由Add Guide按帧注入，不是Ref2VA参考；提示词禁止输出<Picture N>或<Subject N>媒体标签，改用‘第N张关键帧图像’和具体帧号描述",
                 ])
+            example_name, example_text = _h3_contract.selected_example(
+                SKILLS_DIR / "aipm-minimax-h3-video", mode, idea, bool(audio_count),
+            )
+            prompt_context["selected_example"] = {
+                "scenario": example_name, "content": example_text,
+                "rule": "仅学习结构；本次mode、素材、台词、帧位与时长优先，禁止复制例中内容",
+            }
             text_payload = {
                 "model": service_model,
                 "messages": [
@@ -1215,6 +1077,10 @@ class AIPMVideoPrompt:
             def validate_segment_text(text: str) -> None:
                 self.validate_prompt_text(text, requested_language)
                 self.validate_h3_structure(text, mode, duration_seconds)
+                try:
+                    _h3_contract.validate_segment(text, planned_dialogue, active_refs, mode)
+                except _h3_contract.ContractError as exc:
+                    raise PromptAssistantError(str(exc)) from exc
                 if planned_dialogue and not re.search(
                     r"<d>\s*\[[^\]]+\]\s*.+?</d>", text, re.DOTALL,
                 ):
@@ -1244,6 +1110,11 @@ class AIPMVideoPrompt:
                 compiled_prompt = self.compile_h3_prompt(
                     timeline_local_prompt, global_prompt, global_negative,
                 )
+                self.validate_h3_structure(compiled_prompt, mode, duration_seconds)
+                try:
+                    _h3_contract.validate_segment(compiled_prompt, planned_dialogue, active_refs, mode)
+                except _h3_contract.ContractError as exc:
+                    raise PromptAssistantError(str(exc)) from exc
                 speaker_ids = set(re.findall(r"\(S\d+\)", timeline_local_prompt))
                 if planned_dialogue and len(speaker_ids) < len(expected_speakers):
                     raise PromptAssistantError(
@@ -1300,6 +1171,9 @@ class AIPMVideoPrompt:
                 "reference_bindings": plan.get("global_reference_bindings") or [],
             },
             "generation_status": "complete" if complete else "interrupted",
+            "h3_contract_version": _h3_contract.VERSION,
+            "planning_status": "degraded" if plan_response.get("aipm_fallback") else "planned",
+            "planning_warnings": ["远程规划不可用，使用本地占位规划；未强加写实风格或文字负向词，请复核分段与台词。"] if plan_response.get("aipm_fallback") else [],
             "resume_key": resume_key,
             "resume_from_segment": None if complete else len(segment_results) + 1,
             "failed_segment_id": failed_segment_id,
@@ -1390,6 +1264,9 @@ class AIPMVideoPrompt:
             package["aipm_operation"] = "revise_segment"
             package["revision_target_segment_id"] = str(target_segment_id)
             package["usage"] = {"stages": usage_records}
+        package["h3_contract_version"] = _h3_contract.VERSION
+        package["planning_status"] = "degraded" if plan_response.get("aipm_fallback") else "planned"
+        package["planning_warnings"] = ["远程规划不可用，采用本地占位规划，请复核分段、素材与帧位；未强加写实风格或文字负向词。"] if plan_response.get("aipm_fallback") else []
         cine_timeline, cine_timeline_json = self._canonical_timeline(package)
         return {"ui": {"text": [package["video_prompt"], package["negative_prompt"], cine_timeline_json]},
                 "result": (
@@ -1433,9 +1310,6 @@ class AIPMVideoPrompt:
                 operation = str(run_payload.get("operation") or "rewrite")
                 target_segment_id = str(run_payload.get("target_segment_id") or "")
                 previous_json = str(run_payload.get("previous_result") or previous_json or "")
-                if operation == "append" and run_payload.get("editor_timeline") is not None:
-                    stored = self._authoring_data(json.loads(previous_json))
-                    previous_json = json.dumps(reconcile_append_editor(stored, run_payload["editor_timeline"]), ensure_ascii=False)
                 modification = str(run_payload.get("instruction") or "").strip()
             except (json.JSONDecodeError, AttributeError) as exc:
                 raise PromptAssistantError("AIPM时间轴操作请求无效") from exc
@@ -1559,13 +1433,21 @@ class AIPMVideoPrompt:
         for index, profile_item in enumerate(reference_profiles):
             if index < len(image_assets):
                 profile_item.update(image_assets[index])
+        if operation == "append" and base_package:
+            # Each append submission's connected loaders describe the new
+            # segment. Provider ordinals must continue after the cached image
+            # profiles; reusing <Picture 1..N> would resolve the appended shot
+            # back to the first segment's assets when packages are merged.
+            old_profiles = base_package.get("reference_profiles")
+            old_profiles = old_profiles if isinstance(old_profiles, list) else []
+            picture_offset = len(old_profiles)
+            for index, item in enumerate(reference_profiles, 1):
+                item["picture_id"] = f"<Picture {picture_offset + index}>"
         # AIPM currently targets one H3 family; the separate generation-mode
         # widget owns the keyframe vs multimodal distinction.  Normalize old
         # persisted profile labels without changing their chosen mode.
         profile = "MiniMax H3"
         mode = self._resolve_mode(profile, str(生成模式), len(reference_profiles), bool(connected_video_count), bool(connected_audio_count))
-        if operation == "append" and base_package:
-            reuse_append_global_images(reference_profiles, base_package, mode)
         if mode != "h3_ref2va" and (connected_video_count or connected_audio_count):
             raise PromptAssistantError("只有多模态模式接受视频或声音参考；其他模式仅按顺序绑定参考图片")
         if mode == "h3_fl2va" and len(reference_profiles) > 2:
@@ -1718,8 +1600,6 @@ class AIPMPromptRefinement:
             "提示词类型": (["自动判断", "生图提示词", "生视频提示词"], {"default": "自动判断"}),
             "目标模型": (REFINEMENT_MODEL_PROFILES, {"default": "自动判断 / 通用（推荐）"}),
             "必须保留的内容": ("STRING", {"default": "", "multiline": True, "dynamicPrompts": False}),
-                "远程服务地址": ("STRING", {"default": "http://127.0.0.1:8080/v1"}),
-            "模型名称": ("STRING", {"default": "Huihui-Qwen3.8-27B-abliterated-Q5_K.gguf"}),
             "输出语言": (["跟随原提示词（推荐）", "中文", "English"],),
         }, "optional": {
             "上次结果JSON": ("STRING", {"default": "", "multiline": True, "dynamicPrompts": False}),
@@ -1810,8 +1690,6 @@ class AIPMImagePrompt:
         return {
             "required": {
                 "画面描述与创作要求": ("STRING", {"default": "", "multiline": True, "dynamicPrompts": False}),
-                "远程服务地址": ("STRING", {"default": "http://127.0.0.1:8080/v1"}),
-                "模型名称": ("STRING", {"default": "Huihui-Qwen3.8-27B-abliterated-Q5_K.gguf"}),
                 "目标生图模型": (IMAGE_MODEL_PROFILES, {"default": "Krea 2 / Krea 2 Turbo 文生图"}),
                 "画面比例": (["自动", "1:1", "16:9", "9:16", "4:3", "3:4", "21:9"],),
                 "提示词语言": (["自动适配（推荐）", "中文", "English"],),
@@ -2263,7 +2141,6 @@ class AIPMCineTimelineAdapter:
             )
             shots.append({
                 "shot_id": shot_id, "start_frame": start, "end_frame": end,
-                "title": str(segment.get("title") or ""),
                 "local_prompt": local_prompt,
                 "camera": "", "transition": "cut" if index == 0 else (
                     str(segment.get("transition") or 默认转场)
@@ -2413,3 +2290,25 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "AIPMVideoPrompt": "AI 提示词大师 · 生视频",
     "AIPMPromptRefinement": "AI 提示词大师 · 提示词细化",
 }
+
+
+# Load the same settings implementation under ComfyUI and standalone probes.
+try:
+    from . import connection_settings as _connection_settings
+except ImportError:
+    import importlib.util as _aipm_importlib
+    _aipm_spec = _aipm_importlib.spec_from_file_location("aipm_connection_settings", Path(__file__).with_name("connection_settings.py"))
+    _connection_settings = _aipm_importlib.module_from_spec(_aipm_spec)
+    _aipm_spec.loader.exec_module(_connection_settings)
+_connection_settings.configure_nodes(NODE_CLASS_MAPPINGS)
+
+
+try:
+    from . import h3_contract as _h3_contract
+except ImportError:
+    import importlib.util as _h3_importlib
+    _h3_spec = _h3_importlib.spec_from_file_location("aipm_h3_contract", Path(__file__).with_name("h3_contract.py"))
+    _h3_contract = _h3_importlib.module_from_spec(_h3_spec)
+    _h3_spec.loader.exec_module(_h3_contract)
+
+AIPMVideoPromptCore.H3_CONTRACT_VERSION = _h3_contract.VERSION
