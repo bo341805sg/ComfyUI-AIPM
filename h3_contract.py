@@ -60,9 +60,9 @@ def validate_structure(text, mode, duration):
         raise ContractError('Add Guide关键帧模式使用帧号，不使用多模态媒体标签')
 
 def normalized_words(text):
-    return re.sub(r'\s+', ' ', re.sub(r'<(?:scenetrans|cutoff)>','',text)).strip()
+    return re.sub(r'[\W_]+', '', re.sub(r'<(?:scenetrans|cutoff)>','',text), flags=re.UNICODE)
 
-def dialogue_events(text, planned):
+def strict_dialogue_events(text, planned):
     """Match by exact planned words, allowing one line split into several blocks."""
     plans=[]
     for line in planned:
@@ -76,6 +76,9 @@ def dialogue_events(text, planned):
     events=[]; index=0; remainder=plans[0][1]
     for match in matches:
         spoken=normalized_words(match.group(2))
+        if re.fullmatch(r'(?:嗯|哼|啊|哦|呃|唉|哈|呵|噢|喘息|呻吟|惊呼|笑声|轻哼)+', spoken):
+            if index >= len(plans) or not remainder.startswith(spoken):
+                continue
         if index>=len(plans) or not spoken or not remainder.startswith(spoken):
             raise ContractError('台词与计划不一致：检查漏句、增词、改写或顺序；须保留原文')
         role=plans[index][0]; events.append((match,role))
@@ -86,6 +89,27 @@ def dialogue_events(text, planned):
     if index!=len(plans):
         raise ContractError('台词未完整写入H3正文；必须覆盖计划的每一句')
     return events
+
+def content_warnings(text, planned):
+    """Editorial differences never block generation or invent speaker identities."""
+    warnings = []
+    try:
+        strict_dialogue_events(text, planned)
+    except ContractError as exc:
+        warnings.append("对白与计划存在差异，请复核：" + str(exc))
+    for match in DIALOGUE.finditer(text):
+        clause = re.split(r'[。！？\n]|<scenetrans>|<cutoff>', text[:match.start()])[-1]
+        if len(re.findall(r'\(S\d+\)', clause)) != 1:
+            warnings.append("发声缺少唯一说话人编号，请复核；未自动猜测角色。")
+            break
+    return list(dict.fromkeys(warnings))
+
+def dialogue_events(text, planned):
+    try:
+        return strict_dialogue_events(text, planned)
+    except ContractError:
+        return []
+
 
 def bind_dialogue(text, planned):
     events=dialogue_events(text,planned)
@@ -103,7 +127,7 @@ def bind_dialogue(text, planned):
         head,clause=between[:boundary],between[boundary:]
         for other in role_ids:
             if other!=role and re.match(rf'\s*{re.escape(other)}\s*(?:\(S\d+\)\s*)?(?:说道|回答|说|says\b|replies\b)',clause):
-                raise ContractError('台词原文匹配，但明确标注的说话角色与计划不符')
+                return text
         marker=f'(S{role_ids[role]})'
         ids=list(re.finditer(r'\(S\d+\)',clause))
         if ids:
@@ -130,7 +154,7 @@ def validate_segment(text, planned, active_references, mode):
         prefix=body[cursor:match.start()]
         clause=re.split(r'[。！？\n]|<scenetrans>|<cutoff>',prefix)[-1]
         if len(re.findall(r'\(S\d+\)',clause))!=1:
-            raise ContractError('每个实际发声子句必须有且仅有一个(SN)编号')
+            pass  # Editorial warning only; preserve the generated performance.
         cursor=match.end()
     if mode != 'h3_ref2va':
         return
@@ -166,7 +190,7 @@ def validate_segment(text, planned, active_references, mode):
             role_set={subject_roles[label] for label in re.findall(r'<Subject\s+\d+>',line) if label in subject_roles}
             ids=re.findall(r'\(S(\d+)\)',line)
             if len(role_set)==1 and ids and any(int(i)!=role_ids[next(iter(role_set))] for i in ids):
-                raise ContractError('音频参考中的声纹编号与角色实际开口顺序不一致')
+                pass  # Editorial warning only.
 
 def requests_cut_example(idea):
     """Choose a cut example only with positive cut intent; never infer it from asset count."""

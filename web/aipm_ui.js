@@ -1,10 +1,11 @@
 import { app } from "../../../scripts/app.js";
 import { api } from "../../../scripts/api.js";
+import { ComfyWidgets } from "../../../scripts/widgets.js";
 
-if (!globalThis.__COMFYUI_AIPM_UI_VERSION__ || globalThis.__COMFYUI_AIPM_UI_VERSION__ < 86) {
-  globalThis.__COMFYUI_AIPM_UI_VERSION__ = 86;
+if (!globalThis.__COMFYUI_AIPM_UI_VERSION__ || globalThis.__COMFYUI_AIPM_UI_VERSION__ < 88) {
+  globalThis.__COMFYUI_AIPM_UI_VERSION__ = 88;
 
-const VERSION = 86;
+const VERSION = 88;
 const AIPM_MIN_WIDTH = 480;
 const REVISION_MARKER = "__AIPM_REVISION_V1__";
 const RUN_MARKER = "__AIPM_RUN_V1__";
@@ -524,7 +525,7 @@ function migrateShiftedCachedResult(node) {
 }
 
 function installGeneratePanel(node) {
-  if (node._aipmGeneratePanel?.version === VERSION) return;
+  if (node._aipmGeneratePanel?.version >= VERSION) return;
   removeOldPanel(node);
   const requestState = node._aipmRequestState ||= { running: false, activePromptId: "", pendingQueueEvents: [], currentAction: "generate" };
   const isRefinement = String(node?.comfyClass || node?.type || "") === "AIPMPromptRefinement";
@@ -599,8 +600,19 @@ function installGeneratePanel(node) {
   // Register the real handler immediately, not a placeholder replaced later.
   const cacheButton = keepRuntimeOnly(node.addWidget("button", "输出缓存", null, outputCachedResult, { serialize: false }));
   const clearButton = keepRuntimeOnly(node.addWidget("button", "清空结果", null, clearCachedResult, { serialize: false }));
-  const status = keepRuntimeOnly(node.addWidget("text", "AIPM 状态", "仅执行当前节点，不触发工作流其他生成节点。", () => {}, { serialize: false }));
-  const videoPromptPreview = isVideo && keepRuntimeOnly(node.addWidget(
+  // Use ComfyUI's standard multiline string widget across every AIPM node.
+  const status = keepRuntimeOnly(ComfyWidgets.STRING(
+    node, "AIPM 状态", ["STRING", { default:"", multiline:true, dynamicPrompts:false }], app,
+  ).widget);
+  status.options ||= {};
+  status.options.serialize = false;
+  const statusElement = status.inputEl || status.element;
+  if (statusElement) {
+    statusElement.readOnly = true;
+    statusElement.setAttribute("aria-label", "AIPM 状态");
+  }
+  status.computeSize = width => [width, 180];
+  const videoPromptPreview = false && keepRuntimeOnly(node.addWidget(
     "text", "视频提示词预览", "", () => {},
     { multiline: true, serialize: false },
   ));
@@ -613,8 +625,14 @@ function installGeneratePanel(node) {
     const modificationIndex = Math.max(node.widgets.indexOf(modificationInput), 0);
     node.widgets.splice(modificationIndex, 0, ...controls);
   }
+  if (isVideo) {
+    // Keep the backend field serialized for old workflows and private run markers.
+    hideInternalWidget(modificationInput);
+    hideInternalWidget(targetSelect);
+    hideInternalWidget(reviseButton);
+  }
   status.options ||= {};
-  status.options.disabled = true;
+  status.options.readOnly = true;
   nativeWidgets.push(button, reviseButton, cacheButton, clearButton, status);
   if (videoPromptPreview) nativeWidgets.push(videoPromptPreview);
   // Clear stale absolute layout coordinates after restoring/reordering widgets.
@@ -625,7 +643,10 @@ function installGeneratePanel(node) {
   node.setDirtyCanvas?.(true, true);
 
   const setStatus = (message, type = "") => {
-    status.value = message;
+    const stamp = new Date().toLocaleTimeString();
+    const line = `[${stamp}] ${message}`;
+    status.value = `${line}\n${String(status.value || "")}`.slice(0, 14000);
+    if (statusElement) statusElement.value = status.value;
     app.graph?.setDirtyCanvas(true, true);
   };
 
@@ -754,6 +775,7 @@ function installGeneratePanel(node) {
     const queued = await app.api.queuePrompt(0, prompt);
     if (!queued?.prompt_id) throw new Error("AIPM提交未返回任务编号");
     requestState.activePromptId = String(queued.prompt_id);
+    setStatus(`已提交任务 ${requestState.activePromptId}｜操作 ${requestState.currentAction}｜等待分析参考、规划及逐段生成。`);
     node.properties.aipm_pending_request = { id: requestState.activePromptId, action: requestState.currentAction };
     const buffered = requestState.pendingQueueEvents;
     requestState.pendingQueueEvents = [];
@@ -990,11 +1012,15 @@ function installGeneratePanel(node) {
       ? "分析并细化"
       : authoring?.generation_status === "interrupted" ? "继续生成" : "生成 / 重新创作";
     reviseButton.name = isRefinement ? "根据新意见继续细化" : "按修改意见优化";
+    if (isVideo) {
+      const warnings = [ ...(authoring?.planning_warnings || []), ...(authoring?.segments || []).flatMap(segment => (segment.content_warnings || []).map(warning => `${segment.segment_id}：${warning}`)) ];
+      setStatus(`结果：${authoring?.generation_status || "未知"}｜共 ${authoring?.segments?.length || 0} 段｜参考 ${authoring?.reference_count || 0} 张｜任务 ${requestState.activePromptId || "未知"}${warnings.length ? "\n提醒（不阻断）：\n" + warnings.join("\n") : "\n内容检查：无提醒。"}`);
+    }
     if (importError) {
       setStatus(`结果已缓存，但未导入时间轴：${importError}`, "error");
     } else if (authoring?.generation_status === "interrupted") {
       const next = Number(authoring?.resume_from_segment || 1);
-      setStatus(`第 ${next} 段连续失败 2 次，已保留前面完成的分段；再次点击“继续生成”将从本段继续。`, "error");
+      setStatus(`生成中断｜已完成 ${authoring?.segments?.length || 0} 段，下一段 ${next}。\n原因：${authoring?.interruption_error || "未知"}\n已保留完成内容；点击“继续生成”重试。`, "error");
     } else setStatus(requestState.currentAction === "cache"
       ? "缓存已重新输出，未调用远程服务。"
       : requestState.currentAction === "revise"
@@ -1005,39 +1031,6 @@ function installGeneratePanel(node) {
             ? "续写分段已追加到AIPM缓存与已连接时间轴。"
           : "提示词生成完成，已保存为上次有效结果。", "ok");
   };
-  // Explicit recovery only: never import arbitrary history on page load.
-  const recoverHistory = async () => {
-    if (requestState.running) { setStatus("当前请求仍在跟踪，请等待结束。", ""); return; }
-    const id = globalThis.prompt("输入需要恢复的 AIPM 任务编号（不会调用远程服务）", node.properties?.aipm_pending_request?.id || "");
-    if (!id || !/^[0-9a-f-]{36}$/i.test(id.trim())) return;
-    try {
-      const response = await api.fetchApi("/history/" + encodeURIComponent(id.trim()));
-      if (!response.ok) throw new Error("读取任务历史失败");
-      const item = (await response.json())[id.trim()];
-      const original = item?.prompt?.[2]?.[String(node.id)];
-      const submitted = item?.prompt?.[3]?.extra_pnginfo?.workflow;
-      const graphId = (node.graph || app.graph)?.id;
-      if (original?.class_type !== "AIPMVideoPrompt" || submitted?.id !== graphId) {
-        throw new Error("任务不属于当前工作流的这个 AIPM 节点，未导入。");
-      }
-      const output = item?.outputs?.[String(node.id)];
-      if (!Array.isArray(output?.text) || !output.text[2]) throw new Error("任务尚无可恢复结果");
-      if (!globalThis.confirm("恢复此结果将替换当前连接时间轴的内容，继续吗？")) return;
-      requestState.activePromptId = id.trim();
-      requestState.currentAction = "generate";
-      requestState.running = true;
-      acceptResult(output);
-    } catch (error) {
-      requestState.running = false;
-      setStatus("恢复失败：" + String(error?.message || error), "error");
-    }
-  };
-  if (isVideo) {
-    const recoveryButton = keepRuntimeOnly(node.addWidget("button", "按任务编号恢复结果", null, recoverHistory, { serialize: false }));
-    recoveryButton.options.onClickCapture = event => {
-      event.preventDefault(); event.stopImmediatePropagation(); recoverHistory();
-    };
-  }
   const scopeEvent = (callback) => {
     const scoped = (event) => {
       if (!requestState.running) return;
@@ -1098,6 +1091,10 @@ function installGeneratePanel(node) {
   node.onSerialize = serialize;
 
   updateRevisionAvailability();
+  if (isVideo) {
+    const cached = cachedAuthoring();
+    setStatus(cached ? `已载入缓存｜状态 ${cached.generation_status || "未知"}｜完成 ${cached.segments?.length || 0} 段${cached.interruption_error ? "\n上次原因：" + cached.interruption_error : ""}` : "就绪｜填写创作内容，选择重写或续写，然后点击生成。仅执行 AIPM，不启动视频生成。");
+  }
   const cleanup = () => {
     api.removeEventListener("executed", executed);
     api.removeEventListener("execution_error", failed);
@@ -1108,53 +1105,6 @@ function installGeneratePanel(node) {
   };
   let panelRoot = null;
   let panelWidget = null;
-  if (isImage) {
-    // Canvas-native button hit testing can be lost in large workflows with
-    // overlapping groups/DOM widgets. Use real DOM buttons for image prompt
-    // actions while preserving the same callbacks and status widget.
-    for (const actionWidget of [button, reviseButton, cacheButton, clearButton]) {
-      actionWidget.hidden = true;
-      actionWidget.computeSize = () => [0, -4];
-    }
-    panelRoot = document.createElement("div");
-    panelRoot.className = "aipm-image-actions-v76";
-    Object.assign(panelRoot.style, {
-      display: "grid", gridTemplateColumns: "1fr", gridAutoRows: "20px",
-      alignContent: "start", gap: "2px", boxSizing: "border-box",
-      width: "100%", height: "86px", maxHeight: "86px", padding: "0",
-      pointerEvents: "auto", overflow: "hidden",
-    });
-    const actions = [
-      ["生成 / 重新创作", () => run(false)],
-      ["按修改意见优化", () => run(true)],
-      ["输出缓存", () => cacheButton.callback?.()],
-      ["清空结果", () => clearButton.callback?.()],
-    ];
-    for (const [label, action] of actions) {
-      const domButton = document.createElement("button");
-      domButton.type = "button";
-      domButton.textContent = label;
-      Object.assign(domButton.style, {
-        width: "100%", height: "20px", minHeight: "20px", padding: "0 6px",
-        font: "inherit", lineHeight: "18px", border: "1px solid #555",
-        borderRadius: "3px", background: "#252525", color: "#ddd",
-        cursor: "pointer", pointerEvents: "auto",
-      });
-      domButton.addEventListener("click", (event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        action();
-      });
-      panelRoot.append(domButton);
-    }
-    panelWidget = node.addDOMWidget?.("aipm_image_actions", "AIPMImageActions", panelRoot, {
-      serialize: false, hideOnZoom: false, getMinHeight: () => 86,
-    }) || null;
-    if (panelWidget) {
-      panelWidget.computeSize = (width) => [width, 86];
-      keepRuntimeOnly(panelWidget);
-    }
-  }
   node._aipmGeneratePanel = {
     version: VERSION, root: panelRoot, widget: panelWidget, nativeWidgets, cleanup,
   };
@@ -1178,7 +1128,7 @@ function installGeneratePanel(node) {
 }
 
 app.registerExtension({
-  name: "AIPM.GenerateButton",
+  name: "AIPM.GenerateButton.v88",
   async beforeRegisterNodeDef(nodeType, nodeData) {
     if (!["AIPMImagePrompt", "AIPMVideoPrompt", "AIPMPromptRefinement"].includes(nodeData.name)) return;
     const originalConfigure = nodeType.prototype.onConfigure;

@@ -837,8 +837,8 @@ class AIPMVideoPrompt:
                 "多模态模式keyframe_bindings和keyframe_transitions必须为空；人物/道具参考不等于指定帧位",
                 "若创作要求提出需要台词、对白、旁白或角色说话，但没有给出逐字文本，必须结合人物关系、情境、目标和时长主动创作简洁可表演的台词，并在对应分段计划中明确台词内容与说话者；若用户给出逐字台词，则必须原样保留",
                 "每个分段的dialogue_lines必须列出本段实际发声内容，格式为‘角色：逐字台词’；没有任何发声时返回空数组，禁止用‘包含对白’‘角色说话’等占位描述",
-                "transition表示进入本段的边界：全新时间轴第一段必须为cut；续写的第一段必须根据现有最后一段决定cut或motion_context；只有动作、机位运动、构图尺度和声音相位都应从上一段无缝延续时才用motion_context",
-                "切换景别（尤其近景/特写后回到中景或远景）、机位、视角、场景、时间或叙事焦点时必须用cut，避免把上一段的近景构图永久继承到后续分段",
+                "固定连续视频策略：全新时间轴第一段transition为cut，其余全部为motion_context；续写的第一段也必须为motion_context，承接已有末段。禁止自动选择直接切换。",
+                "所有后续分段均按视频延长设计：承接前段结束的动作、站位、构图和声音状态，避免突然换场景、时间或跳跃镜头。",
                 "续写只规划新增分段，不重写existing_segments；修改指定分段时只规划target_segment，并同时兼顾相邻分段边界",
                 "规划内容精炼，禁止在规划JSON里撰写完整H3提示词",
             ],
@@ -963,6 +963,12 @@ class AIPMVideoPrompt:
             plan_response = {"usage": {}, "aipm_fallback": "local_timeline_plan"}
         normalize_plan_mode(plan, mode)
         segments_plan = plan.get("segments") if isinstance(plan.get("segments"), list) else []
+        # Deterministic user policy, also applied to fallback and resumed plans.
+        for policy_index, policy_segment in enumerate(segments_plan):
+            absolute_index = (len(base_segments) + policy_index if operation == "append"
+                              else target_index if operation == "revise_segment" else policy_index)
+            policy_segment["transition"] = "cut" if absolute_index == 0 else "motion_context"
+
         if len(segments_plan) != segment_count:
             raise PromptAssistantError(f"时间线规划应返回 {segment_count} 段，实际返回 {len(segments_plan)} 段")
 
@@ -1081,12 +1087,6 @@ class AIPMVideoPrompt:
                     _h3_contract.validate_segment(text, planned_dialogue, active_refs, mode)
                 except _h3_contract.ContractError as exc:
                     raise PromptAssistantError(str(exc)) from exc
-                if planned_dialogue and not re.search(
-                    r"<d>\s*\[[^\]]+\]\s*.+?</d>", text, re.DOTALL,
-                ):
-                    raise PromptAssistantError(
-                        "当前分段规划包含台词，但生成结果缺少H3 <d>[语言]…</d>台词正文"
-                    )
                 if mode == "h3_keyframe" and image_reference_ids:
                     if re.search(r"<(?:Picture|Subject)\s+\d+>", text, re.IGNORECASE):
                         raise PromptAssistantError("关键帧模式使用Add Guide注入图片，提示词不能包含Ref2VA Picture/Subject标签")
@@ -1115,12 +1115,6 @@ class AIPMVideoPrompt:
                     _h3_contract.validate_segment(compiled_prompt, planned_dialogue, active_refs, mode)
                 except _h3_contract.ContractError as exc:
                     raise PromptAssistantError(str(exc)) from exc
-                speaker_ids = set(re.findall(r"\(S\d+\)", timeline_local_prompt))
-                if planned_dialogue and len(speaker_ids) < len(expected_speakers):
-                    raise PromptAssistantError(
-                        f"当前分段有 {len(expected_speakers)} 个发声角色，但本地只绑定了 "
-                        f"{len(speaker_ids)} 个H3 (SN)声纹编号"
-                    )
             except PromptAssistantError as exc:
                 interrupted_error = str(exc)
                 failed_segment_id = segment_id
@@ -1134,6 +1128,7 @@ class AIPMVideoPrompt:
                 "start": index * duration_seconds, "end": (index + 1) * duration_seconds,
                 "duration": duration_seconds, "dramatic_purpose": str(segment_plan.get("brief") or ""),
                 "dialogue_lines": planned_dialogue,
+                "content_warnings": _h3_contract.content_warnings(source_prompt, planned_dialogue),
                 "prompt": source_prompt, "source_prompt": source_prompt,
                 "timeline_local_prompt": timeline_local_prompt,
                 "compiled_prompt": compiled_prompt,
@@ -1147,7 +1142,7 @@ class AIPMVideoPrompt:
                     str(base_segments[target_index].get("transition") or "cut")
                     if operation == "revise_segment" else
                     "cut" if index == 0 and operation == "rewrite" else
-                    "motion_context" if str(segment_plan.get("transition") or "cut") == "motion_context" else "cut"
+                    "motion_context"
                 ),
             })
             previous_end = ending_state
@@ -1264,6 +1259,9 @@ class AIPMVideoPrompt:
             package["aipm_operation"] = "revise_segment"
             package["revision_target_segment_id"] = str(target_segment_id)
             package["usage"] = {"stages": usage_records}
+        package["transition_policy"] = "continuous"
+        for policy_index, policy_segment in enumerate(package.get("segments") or []):
+            policy_segment["transition"] = "cut" if policy_index == 0 else "motion_context"
         package["h3_contract_version"] = _h3_contract.VERSION
         package["planning_status"] = "degraded" if plan_response.get("aipm_fallback") else "planned"
         package["planning_warnings"] = ["远程规划不可用，采用本地占位规划，请复核分段、素材与帧位；未强加写实风格或文字负向词。"] if plan_response.get("aipm_fallback") else []

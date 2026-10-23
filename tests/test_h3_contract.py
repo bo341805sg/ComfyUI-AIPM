@@ -16,10 +16,17 @@ class H3ContractTests(unittest.TestCase):
         self.assertEqual(bound.count('(S1)'),2); self.assertEqual(bound.count('(S2)'),1)
         self.assertEqual(h3.DIALOGUE.findall(source),h3.DIALOGUE.findall(bound))
         self.assertEqual(h3.bind_dialogue(bound,['母亲：等一下。看这里。','女儿：好。']),bound)
-    def test_missing_and_rewritten_dialogue_are_rejected(self):
+    def test_missing_and_rewritten_dialogue_warn_without_blocking(self):
         for body in ('[Shot 1] 母亲说：<d>[Chinese] 等一下。</d>', '[Shot 1] 母亲说：<d>[Chinese] 请等一下。</d> 女儿回答：<d>[Chinese] 好。</d>'):
-            with self.assertRaises(h3.ContractError):
-                h3.bind_dialogue(base(body),['母亲：等一下。','女儿：好。'])
+            source = base(body)
+            planned = ['母亲：等一下。','女儿：好。']
+            self.assertEqual(h3.bind_dialogue(source, planned), source)
+            self.assertTrue(h3.content_warnings(source, planned))
+    def test_punctuation_and_extra_vocalizations_are_allowed(self):
+        text = base('[Shot 1] (S1) <d>[Chinese]等一下！</d> (S1) <d>[Chinese]哼</d>')
+        self.assertFalse(h3.content_warnings(text, ['母亲：等一下。']))
+        h3.validate_segment(text, ['母亲：等一下。'], [], 'text_to_video')
+
     def test_cut_order_is_strict(self):
         for times in [('04','02'),('02','02')]:
             with self.assertRaises(h3.ContractError):

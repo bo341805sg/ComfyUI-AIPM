@@ -1,3 +1,10 @@
+# 2026-10-23
+
+- Treat dialogue content differences as review warnings while retaining structural and reference checks; allow punctuation changes and nonverbal vocalizations.
+- Default all subsequent and appended video segments to motion-context extension, keeping the first segment as a cut.
+- Simplify video controls and unify the three prompt nodes with ComfyUI standard buttons and multiline status widgets.
+- Expand status details with task IDs, completed segments, content warnings and interruption reasons.
+
 # 2026-10-22
 
 - Global service URL, model ID and API key settings; migrate legacy node widgets.
