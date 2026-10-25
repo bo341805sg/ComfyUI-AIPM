@@ -1,5 +1,10 @@
 # 2026-10-25
 
+- Use Subject-only character labels in Ref2VA machine prose and all examples; keep names in internal planning/bindings.
+- Normalize known legacy aliases in local and global prompts while preserving spoken dialogue and quoted visible text.
+- Define stable character aliases and Subject/source mappings; warn on explicit alias collisions and continuation remapping without guessing identity.
+- Preserve existing speaker assignments and requested compound speech; support reused-audio verbal cues without inventing a speaker.
+- Audit all H3 examples for summary syntax, per-subject retention, actor labels and listener states.
 - Carry the previous shot description and boundary state into extension prompts, explicitly as authored intent rather than observed video.
 - Clarify camera movement phases and speaker/listener mouth states; align the continuation example with the preceding truck movement.
 - Restore concrete multi-person action, contact, camera and continuation instructions with three complete examples.

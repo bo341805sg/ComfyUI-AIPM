@@ -737,7 +737,7 @@ class AIPMVideoPrompt:
             raise PromptAssistantError(str(exc)) from exc
 
     @staticmethod
-    def compile_h3_prompt(local_prompt: str, global_prompt: str, negative_prompt: str) -> str:
+    def compile_h3_prompt(local_prompt: str, global_prompt: str, negative_prompt: str, role_bindings=None) -> str:
         """Compile a timeline-local H3 prompt into a standalone executable prompt."""
         text = str(local_prompt or "").strip()
         common = str(global_prompt or "").strip()
@@ -767,7 +767,9 @@ class AIPMVideoPrompt:
                 additions = [common, value]
                 value = "\n".join(part for part in additions if part)
             compiled_sections.append(f"{name}: {value}")
-        return "\n\n".join(part for part in (preamble, *compiled_sections) if part)
+        compiled = "\n\n".join(part for part in (preamble, *compiled_sections) if part)
+        return (_h3_contract.subject_only_prompt(compiled, role_bindings)
+                if target == "detailed_description" else compiled)
 
     def generate_timeline_package(
         self, *, service_url: str, service_model: str, profile: str, mode: str,
@@ -1029,10 +1031,13 @@ class AIPMVideoPrompt:
             active_refs = list(dict.fromkeys(global_reference_ids + segment_refs))
             prior_segments = segment_results or (base_segments if operation == "append" else [])
             prior_segment = prior_segments[-1] if prior_segments else {}
-            prior_prompt = str(prior_segment.get("timeline_local_prompt") or prior_segment.get("source_prompt") or prior_segment.get("prompt") or "")
-            previous_definitions = dict(_h3_contract.sections(prior_prompt)).get("subject_definitions", "")
+            history_segments = (base_segments if operation == "append" else []) + segment_results
+            previous_definitions = _h3_contract.subject_history(history_segments)
+            previous_roles = _h3_contract.internal_role_bindings(history_segments)
             prompt_context = {
-                "previous_subject_definitions": previous_definitions,
+                "previous_subject_definitions": (_h3_contract.subject_only_prompt(previous_definitions, previous_roles)
+                                                 if mode == "h3_ref2va" else previous_definitions),
+                "previous_role_bindings": previous_roles,
                 "previous_camera_context": (_h3_contract.previous_shot_context(prior_segment)
                                             if segment_plan.get("transition") == "motion_context" else {}),
                 "task": "只生成当前分段可直接执行的MiniMax H3提示词纯文本",
@@ -1048,6 +1053,7 @@ class AIPMVideoPrompt:
                 "previous_segment_end": previous_end,
                 "rules": [
                     "输出纯文本，不输出JSON、Markdown或解释",
+                    "Ref2VA机器提示词只用Subject指代人物，不输出姓名、角色名字段或括号别名；定义保留Subject、实际启用参考来源和必要外貌服装。姓名仅用于输入规划及内部previous_role_bindings，换主体、接触对象或发言时重标Subject。台词及可见文字中的姓名原样保留；Base和Add Guide模式不用Subject标签。",
                     "连续延长时读取previous_camera_context的末镜头机位、景别、移动方向、目标及运动阶段，接续而非重启运镜；这是前段文字意图，不是实测画面。未提供的数值不得编造。每个阶段只安排一个主要运镜，区分横移与摇镜、推进与变焦；速度变化需有过程。",
                     "逐次发言写清当前说话者及可见听者状态：非合说时只有当前说话者做语言性口型，其他人双唇自然闭合，以视线和身体回应；说完闭口，再由下一人开口。非语言发声、唱歌和用户明确合说按其实际阶段处理，不能把闭口规则覆盖到这些事件。",
                     "只写当前分段；使用global_prompt_context核对公共设定。人物首次出现、动作接触和空间关系处必须补足必要的身份服装、站位及场景锚点，不因全局已有而省略；只压缩重复风格套话。全局内容由编译器补充，不追加负面词禁令清单",
@@ -1056,7 +1062,7 @@ class AIPMVideoPrompt:
                     "中文模式下只有官方字段、标签和枚举为英文，所有描述正文使用中文",
                     "若segment_plan或创作要求需要台词、对白、旁白或角色说话，必须写出实际可朗读的台词正文，不能只写‘角色说话’或仅描述音色；未指定原文时主动根据剧情创作，已指定原文时逐字保留",
                     "用户给定逐字台词保持原文与说话人；规划自创台词保留含义、顺序和角色，不机械复制标点。实际语言性台词写入<d>[语言] 实际台词</d>；哼声、呻吟、惊呼等按动作表演和声音描述处理，不强迫转换成句子",
-                    "为实际发声者按首次开口顺序绑定稳定(S1)、(S2)编号，并使用<d>[语言] 实际台词</d>；不说话的角色不得虚构声纹编号",
+                    "为实际声源按首次发声顺序绑定稳定(S1)、(S2)编号；普通对白用单人编号，用户要求合说可用(S1,S2)。仅在复用音轨内出现的歌词提示使用Audio来源，不另造说话人。保留已明确绑定的声源编号，不用Subject或图片编号替代",
                 ],
             }
             if mode == "h3_keyframe" and image_reference_ids:
@@ -1117,9 +1123,14 @@ class AIPMVideoPrompt:
                     validator=validate_segment_text,
                 )
                 source_prompt = segment_prompt
+                role_bindings = (_h3_contract.resolved_role_bindings(
+                    source_prompt, reference_profiles, planned_dialogue, previous_roles,
+                ) if mode == "h3_ref2va" else {})
                 timeline_local_prompt = self.bind_dialogue_speaker_ids(source_prompt, planned_dialogue)
+                if mode == "h3_ref2va":
+                    timeline_local_prompt = _h3_contract.subject_only_prompt(timeline_local_prompt, role_bindings)
                 compiled_prompt = self.compile_h3_prompt(
-                    timeline_local_prompt, global_prompt, global_negative,
+                    timeline_local_prompt, global_prompt, global_negative, role_bindings,
                 )
                 self.validate_h3_structure(compiled_prompt, mode, duration_seconds)
                 try:
@@ -1139,9 +1150,12 @@ class AIPMVideoPrompt:
                 "start": index * duration_seconds, "end": (index + 1) * duration_seconds,
                 "duration": duration_seconds, "dramatic_purpose": str(segment_plan.get("brief") or ""),
                 "dialogue_lines": planned_dialogue,
-                "content_warnings": _h3_contract.content_warnings(source_prompt, planned_dialogue),
+                "content_warnings": (_h3_contract.content_warnings(source_prompt, planned_dialogue)
+                                     + (_h3_contract.identity_warnings(source_prompt, previous_definitions)
+                                        if mode == "h3_ref2va" else [])),
                 "prompt": source_prompt, "source_prompt": source_prompt,
                 "timeline_local_prompt": timeline_local_prompt,
+                "role_bindings": role_bindings,
                 "compiled_prompt": compiled_prompt,
                 "negative_prompt": str(segment_plan.get("negative_prompt") or "").strip(),
                 "reference_ids": segment_refs, "effective_reference_ids": active_refs,
@@ -1172,7 +1186,9 @@ class AIPMVideoPrompt:
             "default_segment_duration": duration_seconds, "total_duration": duration_seconds * segment_count,
             "aspect_ratio": aspect_ratio, "prompt_language": "en" if requested_language == "English" else "zh-CN",
             "global": {
-                "prompt": global_prompt, "negative_prompt": global_negative,
+                "prompt": (_h3_contract.subject_only_prompt(global_prompt, _h3_contract.internal_role_bindings(
+                    (base_segments if operation == "append" else []) + segment_results,
+                )) if mode == "h3_ref2va" else global_prompt), "negative_prompt": global_negative,
                 "reference_ids": global_reference_ids,
                 "reference_bindings": plan.get("global_reference_bindings") or [],
             },
@@ -2163,6 +2179,7 @@ class AIPMCineTimelineAdapter:
                     "handoff": str(segment.get("continuity_from_previous") or ""),
                     "dialogue_lines": segment.get("dialogue_lines") or [],
                     "aipm_source_prompt": str(segment.get("source_prompt") or segment.get("prompt") or ""),
+                    "aipm_role_bindings": copy.deepcopy(segment.get("role_bindings") or {}),
                     "aipm_compiled_prompt": str(segment.get("compiled_prompt") or ""),
                     "continue_from_previous": False,
                     "continuity_handle_frames": 1,

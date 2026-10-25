@@ -1,7 +1,7 @@
 import ast,re,math,unittest,importlib.util
 from pathlib import Path
 R=Path(__file__).resolve().parents[1];spec=importlib.util.spec_from_file_location('h3_candidate',R/'h3_contract.py');h3=importlib.util.module_from_spec(spec);spec.loader.exec_module(h3)
-tree=ast.parse((R/'nodes.py').read_text(encoding='utf-8'));fn=next(x for x in ast.walk(tree) if isinstance(x,ast.FunctionDef) and x.name=='compile_h3_prompt');fn.decorator_list=[];env={'re':re};exec(compile(ast.Module(body=[fn],type_ignores=[]),'candidate-compiler','exec'),env)
+tree=ast.parse((R/'nodes.py').read_text(encoding='utf-8'));fn=next(x for x in ast.walk(tree) if isinstance(x,ast.FunctionDef) and x.name=='compile_h3_prompt');fn.decorator_list=[];env={'re':re,'_h3_contract':h3};exec(compile(ast.Module(body=[fn],type_ignores=[]),'candidate-compiler','exec'),env)
 class UpgradeTests(unittest.TestCase):
  def test_negative_list_is_not_positive_prompt(self):
   source='integrated_multimodal_description: [Shot 1] 人物拿起书。\noverall_soundscape: 室内底噪。\nnon_diegetic_music: N/A'

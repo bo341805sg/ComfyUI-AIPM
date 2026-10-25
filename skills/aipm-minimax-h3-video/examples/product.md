@@ -12,7 +12,7 @@ non_diegetic_music: N/A
 subject_definitions:
 <Subject 1> 是 <Picture 1> 中的茶包装，继承盒形、绿色配色和正面文字 "晨光"。
 summary:
-reference generation. 按指定参考与当前动作生成片段。
+[reference generation] 按指定参考与当前动作生成片段。
 retention_analysis:
 <Subject 1> 的盒形、配色、原文字与排版为 fully_preserved；原背景不继承，表现媒介按请求改为纸艺。
 detailed_description:

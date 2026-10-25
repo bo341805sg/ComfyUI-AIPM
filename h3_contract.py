@@ -97,11 +97,15 @@ def content_warnings(text, planned):
         strict_dialogue_events(text, planned)
     except ContractError as exc:
         warnings.append("对白与计划存在差异，请复核：" + str(exc))
+    cursor = 0
     for match in DIALOGUE.finditer(text):
-        clause = re.split(r'[。！？\n]|<scenetrans>|<cutoff>', text[:match.start()])[-1]
-        if len(re.findall(r'\(S\d+\)', clause)) != 1:
-            warnings.append("发声缺少唯一说话人编号，请复核；未自动猜测角色。")
+        clause = re.split(r'[。！？\n]|<scenetrans>|<cutoff>', text[cursor:match.start()])[-1]
+        groups = re.findall(r'\(S\d+(?:\s*,\s*S\d+)*\)', clause)
+        audio_cue = bool(re.search(r'<Audio\s+\d+>', clause)) and not re.search(r'<Subject\s+\d+>', clause)
+        if len(groups) != 1 and not (audio_cue and not groups):
+            warnings.append("发声缺少唯一说话人编号组，请复核；未自动猜测角色。")
             break
+        cursor = match.end()
     return list(dict.fromkeys(warnings))
 
 def dialogue_events(text, planned):
@@ -118,6 +122,7 @@ def bind_dialogue(text, planned):
     role_ids={}
     for _,role in events:
         role_ids.setdefault(role,len(role_ids)+1)
+    assigned_voices = bool(re.search(r"\(S\d+(?:\s*,\s*S\d+)*\)", text))
     output=[]; cursor=0
     for match,role in events:
         between=text[cursor:match.start()]
@@ -129,17 +134,21 @@ def bind_dialogue(text, planned):
             if other!=role and re.match(rf'\s*{re.escape(other)}\s*(?:\(S\d+\)\s*)?(?:说道|回答|说|says\b|replies\b)',clause):
                 return text
         marker=f'(S{role_ids[role]})'
-        ids=list(re.finditer(r'\(S\d+\)',clause))
-        if ids:
-            first=True
-            def replace(_):
-                nonlocal first
-                if first:
-                    first=False; return marker
-                return ''
-            clause=re.sub(r'\(S\d+\)',replace,clause)
-        else:
-            clause+=marker+' '
+        groups = re.findall(r'\(S\d+(?:\s*,\s*S\d+)*\)', clause)
+        if groups:
+            # Collapse only redundant copies of the exact same solo marker.
+            # Preserve compound groups and all distinct existing source assignments.
+            if len(set(groups)) == 1 and ',' not in groups[0]:
+                first = True
+                def keep_first(match):
+                    nonlocal first
+                    if first:
+                        first = False
+                        return match.group(0)
+                    return ''
+                clause = re.sub(r'\(S\d+\)', keep_first, clause)
+        elif not assigned_voices and not re.search(r'<Audio\s+\d+>', clause):
+            clause += marker + ' '
         output.extend((head,clause,match.group(0)))
         cursor=match.end()
     output.append(text[cursor:])
@@ -204,6 +213,7 @@ def selected_example(assets_dir, mode, idea, has_audio=False):
     if mode=='h3_keyframe': name='keyframe'
     elif mode in ('h3_fl2va','h3_i2va','h3_l2va'): name='endpoints'
     elif requests_cut_example(idea): name='continuity'
+    elif requests_group_speech(idea): name='group-dialogue'
     elif re.search(r'哼|呻吟|惊呼|喘息|笑声|nonverbal|gasp|groan',idea,re.I): name='vocal-performance'
     elif 'motion_context continuation' in idea: name='continuation'
     elif re.search(r'三人|三位|three (?:adult|people|person)',idea,re.I): name='multi-person'
@@ -228,6 +238,7 @@ def selected_example(assets_dir, mode, idea, has_audio=False):
 def planning_rules():
     return [
         '继承用户/参考确立的媒介、风格、文字与声音，不默认改成写实电影；无对白或音乐要求时不擅自添加。',
+        '用户给定人物名跨分段保持原文；无姓名使用稳定角色描述。区分角色名、视觉Subject与素材来源，不能因发言顺序、站位或换装而更换身份。',
         '对白按角色与顺序安排；保留用户给定原文，自创对白按剧情合理填写。非语言的哼声、呻吟、惊呼、笑声不强制填入dialogue_lines，写入可见动作和声音表现。',
         '分段按因果推进；只保留当前段有效素材。未听取音频/观看视频时不编造其中内容、节拍或音色分析。',
         '关键帧模式由本地Add Guide注入帧位；多模态参考与官方首尾帧为不同合同，不能混用标签。',
@@ -256,3 +267,132 @@ def previous_shot_context(segment):
         "ending_state": str(segment.get("ending_state") or ""),
         "rule": "Read the final shot's camera side, scale, direction, target and motion phase. Continue them without restarting; unspecified values remain unknown. Do not replay prior actions or claim frame measurements.",
     }
+
+
+def subject_aliases(definitions):
+    """Read explicit local aliases only; never infer a person's identity from appearance."""
+    pairs = []
+    for line in str(definitions).splitlines():
+        label = re.match(r"\s*(<Subject\s+\d+>)", line)
+        alias = re.search(r"(?:角色名|role name)\s*[：:]\s*([^）()，,；;。\n]+)", line, re.I)
+        if label and alias:
+            pairs.append((label.group(1), alias.group(1).strip()))
+    return pairs
+
+
+def identity_warnings(text, previous_definitions=""):
+    """Report explicit mapping conflicts without guessing names or blocking generation."""
+    fields = dict(sections(text))
+    pairs = subject_aliases(fields.get("subject_definitions", ""))
+    prior_pairs = subject_aliases(previous_definitions)
+    prior = {alias: subject for subject, alias in prior_pairs}
+    prior_subjects = dict(prior_pairs)
+    warnings = []
+    seen = {}
+    for subject, alias in pairs:
+        if alias in seen and seen[alias] != subject:
+            warnings.append(f"角色名映射冲突：{alias} 同时绑定 {seen[alias]} 和 {subject}，请复核。")
+        seen[alias] = subject
+        if subject in prior_subjects and prior_subjects[subject] != alias:
+            warnings.append(f"Subject角色名变化：{subject} 从 {prior_subjects[subject]} 变为 {alias}，请复核是否换人或改名。")
+        if alias in prior and prior[alias] != subject:
+            warnings.append(f"续写人物编号变化：{alias} 从 {prior[alias]} 变为 {subject}，请复核。")
+    body = fields.get("detailed_description", "")
+    for match in DIALOGUE.finditer(body):
+        clause = re.split(r'[。！？\n]|</d>', body[:match.start()])[-1]
+        for subject, alias in pairs:
+            if alias in clause and subject not in clause and not re.search(r'<Subject\s+\d+>', clause):
+                warnings.append(f"发言处缺少人物标签：{alias} 应明确绑定 {subject}，请复核。")
+    return list(dict.fromkeys(warnings))
+
+
+def subject_history(segments):
+    """Retain known Subject definitions across temporary absences, latest wording wins."""
+    definitions = {}
+    for segment in segments:
+        prompt = str(segment.get("timeline_local_prompt") or segment.get("source_prompt") or segment.get("prompt") or "")
+        for line in dict(sections(prompt)).get("subject_definitions", "").splitlines():
+            label = re.match(r"\s*(<Subject\s+\d+>)", line)
+            if label:
+                definitions[label.group(1)] = line.strip()
+    return "\n".join(definitions.values())
+
+
+def requests_group_speech(idea):
+    text = re.sub(r'(?:不要|禁止|避免|没有|无|不)\s*(?:所有人|两人|大家)?\s*(?:合说|齐声|同时说|同时开口|同时喊)', '', str(idea))
+    text = re.sub(r'\b(?:do not|never|without|no)\s+(?:speak(?:ing)? together|unison|group speech)', '', text, flags=re.I)
+    return bool(re.search(r'合说|齐声|同时(?:说|开口|喊)|\bspeak together\b|\bunison\b|\bgroup speech\b', text, re.I))
+
+
+def internal_role_bindings(segments):
+    """Collect explicit legacy names/metadata without adding them to machine prose."""
+    result = {}
+    for segment in segments:
+        for role, subject in (segment.get("role_bindings") or {}).items():
+            if re.fullmatch(r'<Subject\s+\d+>', str(subject)):
+                result[str(role)] = str(subject)
+        raw = str(segment.get("source_prompt") or segment.get("timeline_local_prompt") or segment.get("prompt") or "")
+        for subject, role in subject_aliases(dict(sections(raw)).get("subject_definitions", "")):
+            result[role] = subject
+    return result
+
+
+def resolved_role_bindings(text, profiles, planned, previous=None):
+    """Use explicit bindings or a unique role/source match; ambiguity stays unresolved."""
+    result = dict(previous or {})
+    definitions = dict(sections(text)).get("subject_definitions", "")
+    pairs = subject_aliases(definitions)
+    candidates = {}
+    for subject, role in pairs:
+        candidates.setdefault(role, set()).add(subject)
+    subjects_by_media = {}
+    for line in definitions.splitlines():
+        subject = re.match(r'\s*(<Subject\s+\d+>)', line)
+        if subject:
+            for media in MEDIA.finditer(line):
+                label = f'<{media.group(1).title()} {int(media.group(2))}>'
+                subjects_by_media.setdefault(label, set()).add(subject.group(1))
+    for planned_line in planned:
+        role = re.split(r'[：:]', str(planned_line), maxsplit=1)[0].strip()
+        if not role or role in result or role in candidates:
+            continue
+        media = [str(p.get("picture_id") or "") for p in profiles if role in str(p)]
+        matches = set().union(*(subjects_by_media.get(label, set()) for label in media)) if media else set()
+        if len(matches) == 1:
+            candidates[role] = matches
+    for role, subjects in candidates.items():
+        if len(subjects) == 1:
+            result[role] = next(iter(subjects))
+        else:
+            result.pop(role, None)
+    return result
+
+
+def subject_only_prompt(text, role_bindings=None):
+    """Normalize only known aliases; speech and visible quoted text remain verbatim."""
+    aliases = {}
+    for role, subject in (role_bindings or {}).items():
+        if re.fullmatch(r'<Subject\s+\d+>', str(subject)):
+            aliases.setdefault(str(role), set()).add(str(subject))
+    definitions = dict(sections(text)).get("subject_definitions", "")
+    for subject, role in subject_aliases(definitions):
+        aliases.setdefault(role, set()).add(subject)
+    known = {role: next(iter(ids)) for role, ids in aliases.items() if len(ids) == 1 and role}
+    protected = re.compile(r'(<d>.*?</d>|"(?:\\.|[^"\\])*"|“[^”]*”)', re.S)
+    pieces = protected.split(str(text))
+    for index in range(0, len(pieces), 2):
+        prose = re.sub(r'[（(]\s*(?:角色名|role name)\s*[：:][^）)\n]*[）)]', '', pieces[index], flags=re.I)
+        for role in sorted(known, key=len, reverse=True):
+            label = known[role]
+            prose = re.sub(re.escape(label) + r'[ \t]*[（(]\s*' + re.escape(role) + r'\s*[）)]', lambda _: label, prose)
+            prose = re.sub(re.escape(label) + r'[ \t]*' + re.escape(role), lambda _: label, prose)
+        if known:
+            # Replace once, longest first; never cascade one alias replacement into another.
+            pattern = '|'.join(
+                (r'(?<![A-Za-z0-9_])' + re.escape(role) + r'(?![A-Za-z0-9_])')
+                if re.search(r'[A-Za-z0-9]', role) else re.escape(role)
+                for role in sorted(known, key=len, reverse=True)
+            )
+            prose = re.sub(pattern, lambda m: known[m.group(0)], prose)
+        pieces[index] = prose
+    return ''.join(pieces)
