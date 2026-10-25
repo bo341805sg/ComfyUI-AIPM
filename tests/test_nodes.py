@@ -759,7 +759,7 @@ class PromptAssistantTests(unittest.TestCase):
         compiled = nodes.AIPMVideoPromptCore.compile_h3_prompt(local, "统一电影风格", "身份漂移")
         self.assertNotIn("统一电影风格", local)
         self.assertIn("统一电影风格", compiled)
-        self.assertIn("视觉限制：避免出现身份漂移", compiled)
+        self.assertNotIn("身份漂移", compiled)
 
     def test_cinetimeline_adapter_preserves_prompt_layers(self):
         package = {

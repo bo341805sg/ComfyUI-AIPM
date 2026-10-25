@@ -16,7 +16,7 @@ non_diegetic_music:
 - `<Video N>` supplies whole-video editing, continuation, temporal, action, or camera structure. Its embedded sound does not automatically create `<Audio N>`.
 - `<Audio N>` supplies copied or referenced audio. Video and Audio numbering are independent.
 - One subject may be defined by several assets and one asset may define several subjects. Use only references active for this segment.
-- `summary` begins with the accurate combination of: `keyframe completion`, `reference generation`, `video editing`, `video continuation`, `audio reuse`, `audio reference`. Merely receiving a video or audio asset does not prove that task type.
+- `summary` begins with a square-bracketed task prefix such as `[reference generation]` or `[video continuation + reference generation]`, using the accurate combination of: `keyframe completion`, `reference generation`, `video editing`, `video continuation`, `audio reuse`, `audio reference`. Merely receiving a video or audio asset does not prove that task type.
 - `retention_analysis` uses only `fully_preserved`, `partially_preserved`, `attribute_transfer`, `weak_reference`; audio uses `fully_copy`, `partially_copy`, `reference`, `weak_reference`. State inherited attributes and excluded background, pose, framing, or unrelated content.
 - `detailed_description` uses `[Shot 1]`, timed later shots, stable `(SN)` speakers, `<d>[Language] ...</d>`, `<scenetrans>`, and `<cutoff>` under the same timeline rules as Base mode.
 - Preserve reference identity, costume, prop ownership, contact points, spatial direction, light direction, and motion phase where requested. Do not falsely promise pixel-perfect identity.

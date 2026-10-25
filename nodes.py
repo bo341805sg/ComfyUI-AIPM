@@ -741,7 +741,7 @@ class AIPMVideoPrompt:
         """Compile a timeline-local H3 prompt into a standalone executable prompt."""
         text = str(local_prompt or "").strip()
         common = str(global_prompt or "").strip()
-        negative = str(negative_prompt or "").strip()
+        # Negative constraints remain metadata; never inject a ban list into positive text.
         if not text:
             return text
         field_pattern = re.compile(
@@ -765,8 +765,6 @@ class AIPMVideoPrompt:
         for name, value in sections:
             if name == target:
                 additions = [common, value]
-                if negative:
-                    additions.append("视觉限制：避免出现" + negative)
                 value = "\n".join(part for part in additions if part)
             compiled_sections.append(f"{name}: {value}")
         return "\n\n".join(part for part in (preamble, *compiled_sections) if part)
@@ -836,7 +834,7 @@ class AIPMVideoPrompt:
                 "默认每段推进不同剧情，禁止把完整要求复制到每段；用户明确要求重复演示或循环时保留重复，其他情况下brief、opening_state、ending_state不得三项全同",
                 "多模态模式keyframe_bindings和keyframe_transitions必须为空；人物/道具参考不等于指定帧位",
                 "若创作要求提出需要台词、对白、旁白或角色说话，但没有给出逐字文本，必须结合人物关系、情境、目标和时长主动创作简洁可表演的台词，并在对应分段计划中明确台词内容与说话者；若用户给出逐字台词，则必须原样保留",
-                "每个分段的dialogue_lines必须列出本段实际发声内容，格式为‘角色：逐字台词’；没有任何发声时返回空数组，禁止用‘包含对白’‘角色说话’等占位描述",
+                "dialogue_lines只列实际可辨认的对白、歌词、旁白，格式为‘角色：台词’。用户指定原文必须保留；未指定时可按剧情创作。哼声、呻吟、惊呼、喘息、笑声等非语言人声写入brief及动作/声音设计，不要为了填数组虚构对白。没有语言性台词时返回空数组",
                 "固定连续视频策略：全新时间轴第一段transition为cut，其余全部为motion_context；续写的第一段也必须为motion_context，承接已有末段。禁止自动选择直接切换。",
                 "所有后续分段均按视频延长设计：承接前段结束的动作、站位、构图和声音状态，避免突然换场景、时间或跳跃镜头。",
                 "续写只规划新增分段，不重写existing_segments；修改指定分段时只规划target_segment，并同时兼顾相邻分段边界",
@@ -860,7 +858,7 @@ class AIPMVideoPrompt:
                 {"role": "system", "content": "你是影视时间线规划师。只输出小型规划JSON，不写完整提示词。"},
                 {"role": "user", "content": [{"type": "text", "text": json.dumps(plan_context, ensure_ascii=False)}]},
             ],
-            "temperature": 0.2, "max_tokens": min(2400, 700 + segment_count * 260),
+            "temperature": 0.2, "max_tokens": min(6000, 1400 + segment_count * 550),
             "cache_prompt": False, "response_format": self.timeline_plan_format(segment_count),
             "chat_template_kwargs": {"enable_thinking": False},
         }
@@ -916,7 +914,7 @@ class AIPMVideoPrompt:
                 )
         except PromptAssistantError as exc:
             if dialogue_requested:
-                raise PromptAssistantError("含对白的时间线规划失败；为避免漏句或错绑说话者，未使用空台词回退，请重试规划。") from exc
+                raise PromptAssistantError(f"含对白的时间线规划失败：{exc}。已保留原要求，未用空台词回退；请重试规划。") from exc
             import logging
             logging.warning("AIPM H3规划降级：使用本地占位规划，保留原风格和文字，请复核分段、素材与帧位。")
             # Small local fallback: some llama.cpp JSON-schema backends truncate
@@ -1012,7 +1010,9 @@ class AIPMVideoPrompt:
             resumable = False
         usage_records = copy.deepcopy(previous.get("usage", {}).get("stages") or []) if resumable else []
         usage_records.append(plan_response.get("usage") or {})
-        previous_end = str(segment_results[-1].get("ending_state") or "") if segment_results else ""
+        previous_end = (str(segment_results[-1].get("ending_state") or "") if segment_results
+                        else str(base_segments[-1].get("ending_state") or "") if operation == "append" and base_segments
+                        else "")
         start_index = len(segment_results)
         interrupted_error = ""
         failed_segment_id = ""
@@ -1027,24 +1027,35 @@ class AIPMVideoPrompt:
                 else [str(value) for value in segment_plan.get("reference_ids", []) if str(value) in reference_ids]
             )
             active_refs = list(dict.fromkeys(global_reference_ids + segment_refs))
+            prior_segments = segment_results or (base_segments if operation == "append" else [])
+            prior_segment = prior_segments[-1] if prior_segments else {}
+            prior_prompt = str(prior_segment.get("timeline_local_prompt") or prior_segment.get("source_prompt") or prior_segment.get("prompt") or "")
+            previous_definitions = dict(_h3_contract.sections(prior_prompt)).get("subject_definitions", "")
             prompt_context = {
+                "previous_subject_definitions": previous_definitions,
+                "previous_camera_context": (_h3_contract.previous_shot_context(prior_segment)
+                                            if segment_plan.get("transition") == "motion_context" else {}),
                 "task": "只生成当前分段可直接执行的MiniMax H3提示词纯文本",
                 "professional_skill": skill, "target_model": profile, "mode": mode,
                 "language": requested_language, "aspect_ratio": aspect_ratio,
                 "original_idea": idea,
                 "segment_id": segment_id, "duration_seconds": duration_seconds,
-                "global_prompt_is_upstream": True, "global_reference_ids": global_reference_ids,
+                "global_prompt_is_upstream": True, "global_prompt_context": global_prompt,
+                "global_reference_ids": global_reference_ids,
+                "dialogue_policy": "Preserve user-authored words and speakers. Planner-created lines preserve meaning/order; nonverbal vocalizations are performance, not mandatory speech.",
                 "segment_plan": segment_plan, "active_reference_ids": active_refs,
                 "reference_profiles": [item for item in reference_profiles if item["picture_id"] in active_refs],
                 "previous_segment_end": previous_end,
                 "rules": [
                     "输出纯文本，不输出JSON、Markdown或解释",
-                    "只写当前分段的局部H3提示词，不重复global_prompt中的公共风格、人物、服装、场景或声音规范；全局内容将由本地编译器合并",
+                    "连续延长时读取previous_camera_context的末镜头机位、景别、移动方向、目标及运动阶段，接续而非重启运镜；这是前段文字意图，不是实测画面。未提供的数值不得编造。每个阶段只安排一个主要运镜，区分横移与摇镜、推进与变焦；速度变化需有过程。",
+                    "逐次发言写清当前说话者及可见听者状态：非合说时只有当前说话者做语言性口型，其他人双唇自然闭合，以视线和身体回应；说完闭口，再由下一人开口。非语言发声、唱歌和用户明确合说按其实际阶段处理，不能把闭口规则覆盖到这些事件。",
+                    "只写当前分段；使用global_prompt_context核对公共设定。人物首次出现、动作接触和空间关系处必须补足必要的身份服装、站位及场景锚点，不因全局已有而省略；只压缩重复风格套话。全局内容由编译器补充，不追加负面词禁令清单",
                     "只使用active_reference_ids中的参考；多模态保持Subject/Picture/Video/Audio语法，Add Guide关键帧模式只描述帧位",
-                    f"本段严格为{duration_seconds}秒，结尾状态必须落定",
+                    f"本段严格为{duration_seconds}秒；明确边界时动作进行到何处，允许动作继续，不强制停顿、定格或重新摆姿",
                     "中文模式下只有官方字段、标签和枚举为英文，所有描述正文使用中文",
                     "若segment_plan或创作要求需要台词、对白、旁白或角色说话，必须写出实际可朗读的台词正文，不能只写‘角色说话’或仅描述音色；未指定原文时主动根据剧情创作，已指定原文时逐字保留",
-                    "segment_plan.dialogue_lines中的每一条都是必须执行的逐字台词：在对应动作时刻将角色名映射为稳定(SN)，并逐句写入<d>[语言] 实际台词</d>，不得遗漏、概括或移到overall_soundscape",
+                    "用户给定逐字台词保持原文与说话人；规划自创台词保留含义、顺序和角色，不机械复制标点。实际语言性台词写入<d>[语言] 实际台词</d>；哼声、呻吟、惊呼等按动作表演和声音描述处理，不强迫转换成句子",
                     "为实际发声者按首次开口顺序绑定稳定(S1)、(S2)编号，并使用<d>[语言] 实际台词</d>；不说话的角色不得虚构声纹编号",
                 ],
             }
@@ -1056,7 +1067,7 @@ class AIPMVideoPrompt:
                     "关键帧图片由Add Guide按帧注入，不是Ref2VA参考；提示词禁止输出<Picture N>或<Subject N>媒体标签，改用‘第N张关键帧图像’和具体帧号描述",
                 ])
             example_name, example_text = _h3_contract.selected_example(
-                SKILLS_DIR / "aipm-minimax-h3-video", mode, idea, bool(audio_count),
+                SKILLS_DIR / "aipm-minimax-h3-video", mode, idea + (" motion_context continuation" if segment_plan.get("transition") == "motion_context" else ""), bool(audio_count),
             )
             prompt_context["selected_example"] = {
                 "scenario": example_name, "content": example_text,

@@ -1,3 +1,13 @@
+# 2026-10-25
+
+- Carry the previous shot description and boundary state into extension prompts, explicitly as authored intent rather than observed video.
+- Clarify camera movement phases and speaker/listener mouth states; align the continuation example with the preceding truck movement.
+- Restore concrete multi-person action, contact, camera and continuation instructions with three complete examples.
+- Preserve prior subject definitions and ending state when appending; retain necessary global visual anchors in local prompts.
+- Distinguish user-authored dialogue, planner-created speech and nonverbal vocalizations.
+- Stop injecting negative-prompt ban lists into H3 positive descriptions.
+- Increase planning output allowance and expose the underlying dialogue-planning error.
+
 # 2026-10-23
 
 - Treat dialogue content differences as review warnings while retaining structural and reference checks; allow punctuation changes and nonverbal vocalizations.

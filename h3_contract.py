@@ -203,9 +203,12 @@ def requests_cut_example(idea):
 def selected_example(assets_dir, mode, idea, has_audio=False):
     if mode=='h3_keyframe': name='keyframe'
     elif mode in ('h3_fl2va','h3_i2va','h3_l2va'): name='endpoints'
+    elif requests_cut_example(idea): name='continuity'
+    elif re.search(r'哼|呻吟|惊呼|喘息|笑声|nonverbal|gasp|groan',idea,re.I): name='vocal-performance'
+    elif 'motion_context continuation' in idea: name='continuation'
+    elif re.search(r'三人|三位|three (?:adult|people|person)',idea,re.I): name='multi-person'
     elif has_audio and mode=='h3_ref2va': name='voice-reference'
     elif re.search(r'广告|产品|商品|标语|字幕|包装|product|advert',idea,re.I): name='product'
-    elif requests_cut_example(idea): name='continuity'
     elif re.search(r'打斗|武打|搏斗|追逐|格斗|交接|递给|接过|combat|fight|handoff|chase',idea,re.I): name='action'
     else: name='dialogue'
     raw=(Path(assets_dir)/'examples'/f'{name}.md').read_text(encoding='utf-8')
@@ -225,16 +228,31 @@ def selected_example(assets_dir, mode, idea, has_audio=False):
 def planning_rules():
     return [
         '继承用户/参考确立的媒介、风格、文字与声音，不默认改成写实电影；无对白或音乐要求时不擅自添加。',
-        '逐字台词按本段实际发声顺序列为角色：原文。同一角色多句可分行；听者不重复台词。',
+        '对白按角色与顺序安排；保留用户给定原文，自创对白按剧情合理填写。非语言的哼声、呻吟、惊呼、笑声不强制填入dialogue_lines，写入可见动作和声音表现。',
         '分段按因果推进；只保留当前段有效素材。未听取音频/观看视频时不编造其中内容、节拍或音色分析。',
         '关键帧模式由本地Add Guide注入帧位；多模态参考与官方首尾帧为不同合同，不能混用标签。',
         '用片段实际时长安排对白、动作、反应与收尾；超过时长应精简动作，不删除用户逐字台词。',
-        '段内连续事件默认单镜头；动作节拍、描述段落、参考图数量都不等于切镜。保留用户/参考/已批准计划确立的真实切镜或省略，不改成变形；段间transition仍沿用原边界规则。',
+        '段内连续事件默认单镜头；动作节拍、描述段落、参考图数量都不等于切镜。保留用户/参考/已批准计划确立的真实切镜或省略，不改成变形；段间transition服从调用方固定连续延长规则，后续段承接前段结束状态。',
         '在既有brief、opening_state、ending_state、continuity_from_previous内核对首尾和跨镜头的位置、朝向、姿态、接触、道具归属、动作与声音相位；不瞬移坐下或换手，未交代的必要变化须在规划中指出，不新增schema字段。',
         '保留等级针对定义的参考属性：自然动作、姿态和景别变化不自动降低身份/服装的fully_preserved；明确锁定的姿态、方向、关键帧或端点仍须遵守。',
     ]
 
 def requires_dialogue(idea):
-    text=re.sub(r'(?:无|没有|不含|无需|不要|禁止)\s*(?:任何)?\s*(?:对白|台词|旁白|独白|对话|说话)', '', str(idea))
+    text=re.sub(r'(?:无|没有|不含|无需|不要|禁止|不安排|不需要|不加|不写)\s*(?:任何)?\s*(?:对白|台词|旁白|独白|对话|说话)', '', str(idea))
     text=re.sub(r'\b(?:no|without)\s+(?:dialogue|speech|voice[ -]?over)\b','',text,flags=re.I)
     return bool(re.search(r'台词|对白|旁白|独白|对话|开口|说一句|说话|dialogue|voice[ -]?over|\bspeak\b|\bsays?\b',text,re.I))
+
+
+def previous_shot_context(segment):
+    """Carry authored camera/action intent; never describe it as measured video state."""
+    if not segment:
+        return {}
+    prompt = str(segment.get("timeline_local_prompt") or segment.get("source_prompt") or segment.get("prompt") or "")
+    fields = dict(sections(prompt))
+    visual = fields.get("detailed_description") or fields.get("integrated_multimodal_description") or prompt
+    return {
+        "basis": "previous_prompt_intent_not_observed_video",
+        "visual_description": visual,
+        "ending_state": str(segment.get("ending_state") or ""),
+        "rule": "Read the final shot's camera side, scale, direction, target and motion phase. Continue them without restarting; unspecified values remain unknown. Do not replay prior actions or claim frame measurements.",
+    }
