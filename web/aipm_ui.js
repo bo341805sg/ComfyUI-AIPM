@@ -226,7 +226,7 @@ function configureStableNodeLayout(node) {
   delete node.properties.aipm_locked_width;
 
   const contentInput = node.widgets?.find((widget) =>
-    widget.name === "画面描述与创作要求" || widget.name === "视频内容与导演要求"
+    widget.name === "画面描述与创作要求"
   );
   let resizeBaselineHeight = Math.max(1, Number(node.size?.[1]) || 300);
   let contentBaselineHeight = 110;
@@ -528,6 +528,21 @@ function installGeneratePanel(node) {
   if (node._aipmGeneratePanel?.version >= VERSION) return;
   removeOldPanel(node);
   const requestState = node._aipmRequestState ||= { running: false, activePromptId: "", pendingQueueEvents: [], currentAction: "generate" };
+  const graphIdentity = String(node.graph?.id || app.graph?.id || "");
+  const pendingStorageKey = graphIdentity ? `aipm.pending.${graphIdentity}.${node.id}` : "";
+  const savePending = value => {
+    if (!pendingStorageKey) return;
+    try { value ? localStorage.setItem(pendingStorageKey,JSON.stringify(value)) : localStorage.removeItem(pendingStorageKey); } catch {}
+  };
+  if (!requestState.running) {
+    let pending=node.properties?.aipm_pending_request;
+    try { pending ||= pendingStorageKey ? JSON.parse(localStorage.getItem(pendingStorageKey)||"null") : null; } catch {}
+    if (pending?.id) {
+      requestState.running=true;requestState.activePromptId=String(pending.id);
+      requestState.currentAction=String(pending.action||"generate");
+    }
+  }
+
   const isRefinement = String(node?.comfyClass || node?.type || "") === "AIPMPromptRefinement";
   const isVideo = String(node?.comfyClass || node?.type || "") === "AIPMVideoPrompt";
   const isImage = String(node?.comfyClass || node?.type || "") === "AIPMImagePrompt";
@@ -611,7 +626,7 @@ function installGeneratePanel(node) {
     statusElement.readOnly = true;
     statusElement.setAttribute("aria-label", "AIPM 状态");
   }
-  status.computeSize = width => [width, 180];
+  status.computeSize = width => [width, 110];
   const videoPromptPreview = false && keepRuntimeOnly(node.addWidget(
     "text", "视频提示词预览", "", () => {},
     { multiline: true, serialize: false },
@@ -635,11 +650,7 @@ function installGeneratePanel(node) {
   status.options.readOnly = true;
   nativeWidgets.push(button, reviseButton, cacheButton, clearButton, status);
   if (videoPromptPreview) nativeWidgets.push(videoPromptPreview);
-  // Clear stale absolute layout coordinates after restoring/reordering widgets.
-  for (const widget of node.widgets || []) {
-    delete widget.y;
-    delete widget.last_y;
-  }
+  // Let native arrangement and drawing own both visual and hit-test coordinates.
   node.setDirtyCanvas?.(true, true);
 
   const setStatus = (message, type = "") => {
@@ -777,14 +788,33 @@ function installGeneratePanel(node) {
     requestState.activePromptId = String(queued.prompt_id);
     setStatus(`已提交任务 ${requestState.activePromptId}｜操作 ${requestState.currentAction}｜等待分析参考、规划及逐段生成。`);
     node.properties.aipm_pending_request = { id: requestState.activePromptId, action: requestState.currentAction };
+    savePending(node.properties.aipm_pending_request);
+    app.graph?.change?.();
     const buffered = requestState.pendingQueueEvents;
     requestState.pendingQueueEvents = [];
     for (const [handler, event] of buffered) handler(event);
   };
 
   run = async (revise = false) => {
+    setStatus("已收到点击，正在检查输入与任务状态……", "");
+    if (requestState.checkingSubmission) return;
     if (requestState.running) {
-      setStatus("当前AIPM请求仍在执行，请等待完成；无需重复点击。", "");
+      requestState.checkingSubmission=true;
+      try {
+        await checkPendingHistory();
+        // Recovering an existing result must never also submit another request.
+        if (!requestState.running) return;
+        const response=await api.fetchApi("/queue");
+        if(!response.ok)throw new Error(`HTTP ${response.status}`);
+        const queue=await response.json();
+        const active=[...(queue.queue_running||[]),...(queue.queue_pending||[])].some(task=>String(task?.[1])===requestState.activePromptId);
+        if(active){setStatus(`任务 ${requestState.activePromptId} 仍在执行或排队，请等待。`,"");return;}
+        requestState.running=false;
+        delete node.properties.aipm_pending_request;
+        savePending(null);
+        setStatus("已解除失效的等待状态。请再次点击生成；本次未重新请求模型。","error");
+      } catch(error){setStatus(`无法确认旧任务状态：${error?.message||error}。未重复提交。`,"error");}
+      finally {requestState.checkingSubmission=false;}
       return;
     }
     const idea = node.widgets?.find((widget) =>
@@ -953,6 +983,8 @@ function installGeneratePanel(node) {
   // no value, so the parent discards that update. Handle its forwarded DOM
   // activation directly and stop the synthetic path to prevent duplicates.
   for (const actionWidget of [button, reviseButton, cacheButton, clearButton]) {
+    actionWidget.disabled = false;
+    actionWidget.options ||= {};
     actionWidget.options.onClickCapture = (event) => {
       event.preventDefault();
       event.stopImmediatePropagation();
@@ -966,11 +998,18 @@ function installGeneratePanel(node) {
     // after the first acceptance requestState.running is false, so replay cannot overwrite
     // subsequent edits or import cached results during segment generation.
     if (!requestState.running || !Array.isArray(output?.text)) return;
+    // Persist before dispatching to third-party preview/timeline components.
+    if (output.text[2]) {
+      node.properties ||= {};
+      node.properties.aipm_previous_result=String(output.text[2]);
+      if(previousResult) previousResult.value=String(output.text[2]);
+    }
+
     if (videoPromptPreview && output?.text?.[0] != null) {
       videoPromptPreview.value = String(output.text[0]);
       node.setDirtyCanvas?.(true, true);
     }
-    writeTextToLinkedPreviews(node, output);
+    try { writeTextToLinkedPreviews(node, output); } catch(error) { console.warn("[AIPM] Result cached; preview update failed",error); }
     const raw = output?.text?.[2];
     let authoring = null;
     let importError = "";
@@ -1004,6 +1043,7 @@ function installGeneratePanel(node) {
     if (!requestState.running) return;
     requestState.running = false;
     delete node.properties.aipm_pending_request;
+    savePending(null);
     button.disabled = false;
     reviseButton.disabled = false;
     cacheButton.disabled = false;
@@ -1021,7 +1061,7 @@ function installGeneratePanel(node) {
     } else if (authoring?.generation_status === "interrupted") {
       const next = Number(authoring?.resume_from_segment || 1);
       setStatus(`生成中断｜已完成 ${authoring?.segments?.length || 0} 段，下一段 ${next}。\n原因：${authoring?.interruption_error || "未知"}\n已保留完成内容；点击“继续生成”重试。`, "error");
-    } else setStatus(requestState.currentAction === "cache"
+    } else if (!isVideo) setStatus(requestState.currentAction === "cache"
       ? "缓存已重新输出，未调用远程服务。"
       : requestState.currentAction === "revise"
         ? "提示词优化完成，已保存为新的有效版本。"
@@ -1058,16 +1098,64 @@ function installGeneratePanel(node) {
     updateRevisionAvailability();
     setStatus(`生成失败：${detail?.exception_message || detail?.message || "请查看执行错误"}`, "error");
   });
-  const completedWithoutNodeResult = scopeEvent(() => {
-    setTimeout(() => {
-      if (!requestState.running) return;
-      requestState.running = false;
-      button.disabled = false;
-      clearButton.disabled = false;
-      updateRevisionAvailability();
-      setStatus("本次队列已经结束，但没有收到新的AIPM结果；按钮已自动恢复，请检查任务队列或再次提交。", "error");
-    }, 0);
+  let historyCheckBusy=false;
+  let disposed=false;
+  async function checkPendingHistory() {
+    if(disposed || historyCheckBusy || !requestState.running || !requestState.activePromptId)return;
+    const promptId=requestState.activePromptId;
+    historyCheckBusy=true;
+    try {
+      const response=await api.fetchApi(`/history/${encodeURIComponent(promptId)}`);
+      if(!response.ok) return "retry";
+      const history=(await response.json())?.[promptId];
+      if(disposed || !requestState.running || requestState.activePromptId!==promptId)return;
+      if(!history)return "pending";
+      const outputs=history.outputs||{}, graph=history.prompt?.[2]||{};
+      const candidates=Object.keys(outputs).filter(id=>(String(id)===String(node.id)||String(id).endsWith(`:${node.id}`))
+        && String(graph[id]?.class_type||"")===String(node.comfyClass||node.type||""));
+      if(candidates.length===1 && Array.isArray(outputs[candidates[0]]?.text) && outputs[candidates[0]].text.some(v=>String(v||"").trim())) {
+        acceptResult(outputs[candidates[0]]);
+      } else if(history.status?.completed || history.status?.status_str==="error") {
+        requestState.running=false;
+        button.disabled=reviseButton.disabled=cacheButton.disabled=clearButton.disabled=false;
+        updateRevisionAvailability();
+        setStatus(`任务 ${promptId} 已结束，历史中未找到该节点的有效结果。请检查任务错误；没有自动重新提交。`,"error");
+      }
+    } catch(error) {
+      console.warn("[AIPM] History check deferred; pending task retained",error);
+      return "retry";
+    } finally {historyCheckBusy=false;}
+  }
+  let recoveryTimer=null;
+  let recoveryGeneration=0;
+  function recoverOnEvent(expectCompleted=false) {
+    if(disposed || !requestState.running || !requestState.activePromptId)return;
+    if(recoveryTimer!==null)return;
+    const generation=++recoveryGeneration;
+    const promptId=requestState.activePromptId;
+    let attempts=0;
+    const attempt=async()=>{
+      if(disposed || generation!==recoveryGeneration || !requestState.running || requestState.activePromptId!==promptId){recoveryTimer=null;return;}
+      const result=await checkPendingHistory();
+      attempts++;
+      if(!disposed && generation===recoveryGeneration && requestState.running && requestState.activePromptId===promptId
+          && attempts<3 && (result==="retry" || (expectCompleted && result==="pending"))) {
+        recoveryTimer=setTimeout(attempt,attempts*1500);
+      } else recoveryTimer=null;
+    };
+    recoveryTimer=setTimeout(attempt,300);
+  }
+  // Push is primary. History is consulted only after completion, reconnect, or reload.
+  const reconnected=()=>recoverOnEvent(false);
+  api.addEventListener("reconnected",reconnected);
+  const initialHistoryTimer=setTimeout(()=>recoverOnEvent(false),300);
+  const completedWithoutNodeResult=scopeEvent(()=>recoverOnEvent(true));
+  const stageProgress = scopeEvent(({ detail }) => {
+    const id = String(detail?.node || "");
+    if (id !== String(node.id) && !id.endsWith(`:${node.id}`)) return;
+    setStatus(`处理中：${String(detail?.message || "等待接口响应")}\n任务 ${requestState.activePromptId}`, "");
   });
+  api.addEventListener("aipm_stage", stageProgress);
   api.addEventListener("executed", executed);
   api.addEventListener("execution_error", failed);
   api.addEventListener("execution_success", completedWithoutNodeResult);
@@ -1096,6 +1184,12 @@ function installGeneratePanel(node) {
     setStatus(cached ? `已载入缓存｜状态 ${cached.generation_status || "未知"}｜完成 ${cached.segments?.length || 0} 段${cached.interruption_error ? "\n上次原因：" + cached.interruption_error : ""}` : "就绪｜填写创作内容，选择重写或续写，然后点击生成。仅执行 AIPM，不启动视频生成。");
   }
   const cleanup = () => {
+    disposed=true;
+    recoveryGeneration++;
+    if(recoveryTimer!==null)clearTimeout(recoveryTimer);
+    api.removeEventListener("reconnected",reconnected);
+    clearTimeout(initialHistoryTimer);
+    api.removeEventListener("aipm_stage", stageProgress);
     api.removeEventListener("executed", executed);
     api.removeEventListener("execution_error", failed);
     api.removeEventListener("execution_success", completedWithoutNodeResult);
@@ -1127,6 +1221,112 @@ function installGeneratePanel(node) {
   });
 }
 
+function removeSegmentInstructionPanel(node) {
+  node._aipmSegmentResizeObserver?.disconnect();
+  node._aipmSegmentResizeObserver = null;
+  for (const widget of node._aipmSegmentEditors || []) {
+    widget.onRemove?.();
+    (widget.inputEl || widget.element)?.remove?.();
+    node.widgets = (node.widgets || []).filter(item => item !== widget);
+  }
+  node._aipmSegmentEditors = [];
+  const legacy = node._aipmSegmentInstructionWidget;
+  if (legacy) {
+    legacy.element?.remove?.();
+    node.widgets = (node.widgets || []).filter(item => item !== legacy);
+    node._aipmSegmentInstructionWidget = null;
+  }
+}
+
+function installSegmentInstructionPanel(node) {
+  if (String(node.comfyClass || node.type) !== "AIPMVideoPrompt") return;
+  removeSegmentInstructionPanel(node);
+  let storage = node.widgets?.find(w => w.name === "分段说明JSON");
+  if (!storage) storage = node.addWidget("text", "分段说明JSON", "[]", () => {}, {});
+  hideInternalWidget(storage);
+  storage.draw = () => {};
+  const internal = storage.inputEl || storage.element;
+  if (internal?.style) internal.style.display = "none";
+  let soundStorage = node.widgets?.find(w => w.name === "全局声音描述");
+  if (!soundStorage) soundStorage = ComfyWidgets.STRING(node,"全局声音描述",["STRING",{default:"",multiline:true,dynamicPrompts:false}],app).widget;
+  hideInternalWidget(soundStorage);
+  soundStorage.draw = () => {};
+  const soundInternal = soundStorage.inputEl || soundStorage.element;
+  if (soundInternal?.style) soundInternal.style.display = "none";
+  const countWidget = node.widgets?.find(w => w.name === "分段数量");
+  const globalInput = node.widgets?.find(w => w.name === "视频内容与导演要求");
+  // Keep the original backend STRING widget, including ComfyUI's native styling.
+  if (globalInput) {
+    globalInput.computeSize = width => [width, 180];
+    globalInput.options ||= {};
+    globalInput.options.minHeight = 180;
+    globalInput.options.maxHeight = 180;
+  }
+  const read = () => {
+    try { const value=JSON.parse(String(storage.value || "[]")); return Array.isArray(value) ? value.map(String) : []; }
+    catch { return []; }
+  };
+  const render = () => {
+    removeSegmentInstructionPanel(node);
+    const values=read();
+    const count=Math.max(1,Math.min(12,Number(countWidget?.value)||1));
+    let insertAt = node.widgets.indexOf(globalInput) + 1;
+    // Display a native editor here; retain serialized backend input at its original position.
+    const soundEditor=ComfyWidgets.STRING(node,"全局声音描述（选填）",["STRING",{default:String(soundStorage.value||""),multiline:true,dynamicPrompts:false}],app).widget;
+    soundEditor.serialize=false;
+    soundEditor.options ||= {};
+    Object.assign(soundEditor.options,{serialize:false,minHeight:110,maxHeight:110});
+    soundEditor.computeSize=width=>[width,110];
+    soundEditor.value=String(soundStorage.value||"");
+    const commitSound=()=>{soundStorage.value=String(soundEditor.value||"");node.graph?.change?.();};
+    const soundCallback=soundEditor.callback;
+    soundEditor.callback=function(...args){const result=soundCallback?.apply(this,args);commitSound();return result;};
+    const soundElement=soundEditor.inputEl||soundEditor.element;
+    if(soundElement){soundElement.placeholder="对白语言、音色、环境声、音乐或静音要求；留空沿用整体要求";soundElement.addEventListener("input",()=>{soundEditor.value=soundElement.value;commitSound();});}
+    node.widgets.splice(node.widgets.indexOf(soundEditor),1);
+    node.widgets.splice(insertAt++,0,soundEditor);
+    node._aipmSegmentEditors.push(soundEditor);
+
+    for (let i=0; i<count; i++) {
+      const widget=ComfyWidgets.STRING(node,`第 ${i+1} 段说明（选填）`,["STRING",{default:values[i]||"",multiline:true,dynamicPrompts:false}],app).widget;
+      widget.serialize=false;
+      widget.options ||= {};
+      widget.options.serialize=false;
+      widget.options.minHeight=110;
+      widget.options.maxHeight=110;
+      widget.computeSize=width=>[width,110];
+      widget.value=values[i]||"";
+      const commit=()=>{ const all=read(); while(all.length<=i)all.push(""); all[i]=String(widget.value||""); storage.value=JSON.stringify(all); node.graph?.change?.(); };
+      const original=widget.callback;
+      widget.callback=function(...args){ const result=original?.apply(this,args); commit(); return result; };
+      const element=widget.inputEl || widget.element;
+      if(element){
+        element.placeholder="动作、对白、镜头或结束状态；留空自动规划";
+        element.addEventListener("input",()=>{widget.value=element.value;commit();});
+      }
+      node.widgets.splice(node.widgets.indexOf(widget),1);
+      node.widgets.splice(insertAt++,0,widget);
+      node._aipmSegmentEditors.push(widget);
+    }
+    requestAnimationFrame(()=>{
+      if (node.graph) node.arrange?.();
+      const minimum = node.computeSize?.();
+      if (minimum && Number.isFinite(Number(minimum[1]))) {
+        const width = Math.max(AIPM_MIN_WIDTH, Number(node.size?.[0]) || Number(minimum[0]));
+        node.setSize?.([width, Number(minimum[1])]);
+      }
+      node.setDirtyCanvas?.(true,true);
+    });
+  };
+  if(countWidget && !countWidget._aipmSegmentCallback){
+    const original=countWidget.callback;
+    countWidget.callback=function(...args){const result=original?.apply(this,args);node._aipmRefreshSegmentInstructions?.();return result;};
+    countWidget._aipmSegmentCallback=true;
+  }
+  node._aipmRefreshSegmentInstructions=render;
+  render();
+}
+
 app.registerExtension({
   name: "AIPM.GenerateButton.v88",
   async beforeRegisterNodeDef(nodeType, nodeData) {
@@ -1137,6 +1337,7 @@ app.registerExtension({
       // Workflow values are restored positionally. Runtime-only controls may
       // already have been added by onNodeCreated, so remove them before the
       // core loader assigns widgets_values, then rebuild them afterwards.
+      removeSegmentInstructionPanel(this);
       removeOldPanel(this);
       const result = originalConfigure?.apply(this, arguments);
       migrateReferenceInputNames(this);
@@ -1150,13 +1351,20 @@ app.registerExtension({
       migrateVideoDurationWidget(this);
       configureStableNodeLayout(this);
       installGeneratePanel(this);
+      installSegmentInstructionPanel(this);
       return result;
     };
     const original = nodeType.prototype.onNodeCreated;
     const originalConnectionsChange = nodeType.prototype.onConnectionsChange;
     nodeType.prototype.onConnectionsChange = function () {
       const result = originalConnectionsChange?.apply(this, arguments);
-      requestAnimationFrame(() => syncDynamicReferenceInputs(this));
+      if (!this._aipmReferenceSyncPending) {
+        this._aipmReferenceSyncPending = true;
+        requestAnimationFrame(() => {
+          this._aipmReferenceSyncPending = false;
+          syncDynamicReferenceInputs(this);
+        });
+      }
       return result;
     };
     nodeType.prototype.onNodeCreated = function () {
@@ -1173,6 +1381,7 @@ app.registerExtension({
         migrateVideoDurationWidget(this);
         configureStableNodeLayout(this);
         installGeneratePanel(this);
+        installSegmentInstructionPanel(this);
       });
       return result;
     };

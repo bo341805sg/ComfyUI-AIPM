@@ -4,7 +4,7 @@ description: Compile approved MiniMax H3 segments using the selected multimodal,
 ---
 # MiniMax H3 segment compiler
 
-Revision 2026-10-25.4. The caller owns mode, duration, active references, language and output schema. Compile the current approved segment. Do not re-plan other segments, invoke tools, add assets or change workflow settings. References and the selected example are appended by the runtime, not fetched by the language model.
+Revision 2026-11-01.3. The caller owns mode, duration, active references, language and output schema. Compile the current approved segment. Do not re-plan other segments, invoke tools, add assets or change workflow settings. References and the selected example are appended by the runtime, not fetched by the language model.
 
 ## Decide before writing
 
@@ -16,6 +16,26 @@ Revision 2026-10-25.4. The caller owns mode, duration, active references, langua
 6. Follow the current stage's response contract. A segment-text request returns only its complete H3 prompt without a JSON wrapper; JSON requests return only their specified fields. An example never overrides the schema, current references or user intent.
 
 7. A `[Shot]` is a real camera-shot boundary, not an action beat, paragraph or reference-file boundary. Keep a continuous event in one shot by default. Preserve cuts or ellipses established by the user, references or approved plan; do not replace them with a morph or camera move. This does not change the timeline's separate segment-boundary `transition` rules.
+
+## Compilation fidelity comes first
+
+Treat the approved brief as a contract, not a request to decorate it. Before drafting, distinguish explicit facts, necessary neutral realization and unknown facts. Leave unspecified names, physical features, clothing, lens numbers, props and background events unspecified unless needed to make the supplied action understandable. A general style request is not permission to invent them. Do not add a sip, touch, animal vocalization, extra reaction or camera move to fill time. Preserve authored specificity even when it is demanding; surface feasibility conflicts in planning rather than silently deleting requirements.
+
+For EVERY intelligible spoken turn, including a returning speaker, write the actual source plus `(Sx)` and `<d>[Language]exact words</d>`. Plain quoted speech after `(Sx)` is not the output format. Before returning, compare all spoken turns against the approved script in order; preserve spoken names and punctuation meaning. Do not replace known character identities with newly designed generic lookalikes.
+
+A visible event is not automatically an audible event: flashing lights need no thud; looking or nodding need no added sound cue. Only describe physically motivated and requested/necessary sounds. Put each significant synchronized sound at its triggering action in the timeline; the soundscape summarizes the continuing bed without becoming a second event script. Reference rhythm does not imply copying a soundtrack. Without actual audio analysis, do not call chosen cut times measured beats or claim that unknown audio is preserved unmodified. Preserve requested shot counts/durations as editorial goals, and expose missing timing evidence in planning. Use enough concise shot prose to finish every required section; do not spend the output budget on repeated invariants or ornate environments.
+
+## Priorities inside the selected format
+
+Apply these before polishing adjectives. Keep this reasoning internal; emit only the caller's existing fields.
+
+1. **Action fidelity:** for a consequential event, establish the current state, visible trigger, ordered action/contact, result and next-segment handoff. Identify actor, target, location and who controls the prop. State requested object counts naturally; an object moving between hands or locations remains the same object. Do not silently create a duplicate, complete an unfinished action off-screen, replay an earlier action or close/open a container without its action. Preserve intentional off-screen events and approved cuts.
+2. **Selective invariants:** separate protected identity, clothing, object count and scene attributes from the pose, position, expression or camera states meant to change. Retention applies to the named attributes, not a blanket freeze. Repeat a fragile constraint at its relevant transition, not in every sentence. Resolve contradictions against the approved plan; do not invent a repair event.
+3. **Image quality:** express requested lighting, material response, subject visibility and focus concretely. At a critical exchange, keep the necessary hands and object visible if the approved framing allows it. Do not automatically add shallow depth of field, motion blur, focus hunting, exposure pumping, heavy shake, haze, beauty smoothing or skin effects to mean quality. Preserve them when authored. Keep reference style; do not turn a painted reference photorealistic. Quality words such as 8k do not change actual output resolution.
+4. **Sound accuracy:** attach each important sound to its visible or specified off-screen cause and its onset/stop/decay. Keep exact words, speaker and authored delivery; account for spoken duration and listening pauses. Separate environmental ambience, event Foley, nonverbal performance, intelligible speech and audience-only score. Carry unfinished sound across continuation instead of restarting it. Use stereo position or distance only when supplied or meaningfully supported by the scene; do not invent a sound from an unread file or add a generic sound catalogue.
+5. **Timing and economy:** distinguish shot cuts from action phases and local segment time from whole-sequence time. Use timing only within the current duration; follow the caller's continuation clock contract rather than inventing a prefix offset. If the segment is crowded, simplify optional prose and simultaneous actions before compressing authored dialogue. Map imported STYLE/vocals/sounds headings into the existing mode fields; do not create new top-level tags or copy pasted backslash escapes.
+
+Final silent pass: same entities and counts; plausible contact/order; achievable ending; camera/focus consistent with intent; correct speaker and words; caused and timed sound; no unsupported quality defaults. A static hold needs no invented action. This is a prompting strategy, not a guarantee of model fidelity or voice identity.
 
 ## Subject-only machine prose (Ref2VA only)
 
@@ -83,3 +103,7 @@ Before returning, check current format, active/defined labels, user-authored lin
 Sources reviewed 2026-10-21: MiniMaxAI/MiniMax-H3 model card and MiniMax-AI/MiniMax-H3 h3-prompt-writing guides. BeatAPI's H3 gallery is case-study material, not validation of our local checkpoint/recipe.
 
 Local continuity refinements reviewed 2026-10-22 against the supplied moodyMinimaxH3Prompt_v10 guide; this local reference is not evidence of additional backend capabilities.
+
+## Global defaults and segment inheritance
+
+Use global story and sound as defaults. A segment overrides only the attributes it explicitly names; blank or omitted attributes inherit the global defaults. An explicit local exception affects that segment only. Report contradictory requirements or overrides in the planner's planning_warnings with segment and affected property; do not silently rewrite user intent. Ordinary action progression is not a conflict. Keep overridden constraints out of unconditional global machine prose. Automatically add only necessary ambience and physically caused Foley already supported by the scene/actions; silence takes precedence. Do not invent dialogue, narration, animal calls, alarms, music or new sound sources. Explicit requests for authored dialogue or sound still apply.

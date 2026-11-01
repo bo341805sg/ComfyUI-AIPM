@@ -2,7 +2,7 @@
 import re
 from pathlib import Path
 
-VERSION = '2026-10-22.1'
+VERSION = '2026-11-01.3'
 FIELDS = r'subject_definitions|summary|retention_analysis|detailed_description|integrated_multimodal_description|overall_soundscape|non_diegetic_music'
 BASE = ['integrated_multimodal_description', 'overall_soundscape', 'non_diegetic_music']
 REF = ['subject_definitions', 'summary', 'retention_analysis', 'detailed_description', 'overall_soundscape', 'non_diegetic_music']
@@ -32,6 +32,11 @@ def validate_structure(text, mode, duration):
         raise ContractError('H3机器提示词不能包含编辑标题或Markdown代码围栏')
     if text.count('<d>') != text.count('</d>') or text.count('<d>') != len(DIALOGUE.findall(text)):
         raise ContractError('台词必须使用完整的<d>[语言]逐字文本</d>')
+    # Catch the observed raw-quoted speaker output without making editorial
+    # dialogue differences or nonverbal performance into new content gates.
+    untagged = DIALOGUE.sub('', text)
+    if re.search(r'\(S\d+(?:\s*,\s*S\d+)*\)\s*[:：]?\s*["“]', untagged):
+        raise ContractError('说话人后的直接台词缺少<d>[Language]原文</d>标签')
     if any(not words.strip() for _,words in DIALOGUE.findall(text)):
         raise ContractError('台词正文不能为空')
     body = dict(parts).get('detailed_description', dict(parts).get('integrated_multimodal_description',''))
@@ -396,3 +401,33 @@ def subject_only_prompt(text, role_bindings=None):
             prose = re.sub(pattern, lambda m: known[m.group(0)], prose)
         pieces[index] = prose
     return ''.join(pieces)
+
+
+def inheritance_rules():
+    return [
+        "整体描述与全局声音是默认约束；逐段说明只覆盖其中明确指定的属性，空白或未提及的属性继承全局，不能将其他段专属内容复制到本段。",
+        "自动声音仅补与已有场景和动作因果明确的必要环境底噪、脚步、衣料与接触声；整体或本段明确要求静音时不补。未知空间不臆造混响；不得自动新增对白、旁白、动物叫声、警报、音乐或新声源。用户已要求创作对白时可按原有规划规则创作。",
+        "逐段明确例外只作用于本段，后续未指定段恢复继承全局；把覆盖关系和无法同时满足的声音、身份、场景、动作或时序冲突写入planning_warnings，指出段号、原要求、本段要求及采用方式，不静默丢弃要求。普通剧情推进不是冲突。",
+        "全局声音字段与整体描述若互相矛盾也写入planning_warnings；不能靠省略用户原话隐藏冲突。仅将全段共同成立的指令编入global_prompt，存在逐段例外的限制在各段brief落实，避免编译时重新引入相互矛盾的全局句子。",
+    ]
+
+
+def inheritance_warnings(idea, sound, instructions):
+    """Conservative explicit music conflicts; other semantics are planner-reviewed."""
+    def music_policy(text):
+        text = str(text)
+        if re.search(r'无配乐|无音乐|不要(?:背景)?音乐|禁止(?:背景)?音乐|no (?:background )?music|no score|without music', text, re.I):
+            return 'off'
+        if re.search(r'添加(?:背景)?音乐|加入(?:背景)?音乐|加配乐|加入配乐|播放(?:背景)?音乐|add (?:background )?music|with (?:a )?score', text, re.I):
+            return 'on'
+        return None
+    a, b = music_policy(idea), music_policy(sound)
+    warnings = []
+    if a and b and a != b:
+        warnings.append('全局冲突：整体描述与全局声音的配乐要求相反；请复核，不能静默忽略任一要求。')
+    global_policy = b or a
+    for i, local in enumerate(instructions):
+        policy = music_policy(local)
+        if global_policy and policy and policy != global_policy:
+            warnings.append(f'第{i+1}段声音覆盖：全局配乐为{global_policy}，本段明确要求{policy}；仅本段按逐段说明执行，其他段继承全局。')
+    return warnings

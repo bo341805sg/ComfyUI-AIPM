@@ -276,6 +276,23 @@ class PromptAssistantError(RuntimeError):
     pass
 
 
+
+def _emit_aipm_stage(message):
+    """Best-effort UI telemetry; never affects remote generation."""
+    try:
+        from server import PromptServer
+        serv = PromptServer.instance
+        running = list(serv.prompt_queue.currently_running.values())
+        if len(running) != 1:
+            return
+        task = running[0]
+        serv.send_sync("aipm_stage", {
+            "prompt_id": str(task[1]), "node": str(serv.last_node_id),
+            "message": str(message),
+        }, (task[3] or {}).get("client_id"))
+    except Exception:
+        pass
+
 class OpenAICompatibleClient:
     @staticmethod
     def endpoint(service_url: str) -> str:
@@ -344,6 +361,7 @@ class OpenAICompatibleClient:
         last_text = ""
         last_connection_error = None
         for attempt in range(attempts):
+            _emit_aipm_stage(f"{stage}｜请求 {attempt + 1}/{attempts}，等待接口响应")
             try:
                 response = cls.request(service_url, current)
             except PromptAssistantError as exc:
@@ -363,6 +381,7 @@ class OpenAICompatibleClient:
                 parsed = cls.parse_object(last_text)
                 if validator is not None:
                     validator(parsed)
+                _emit_aipm_stage(f"{stage}｜响应校验通过")
                 return parsed, response
             except PromptAssistantError as exc:
                 validation_error = str(exc)
@@ -403,13 +422,18 @@ class OpenAICompatibleClient:
         last_error: Exception | None = None
         current = copy.deepcopy(payload)
         for attempt in range(attempts):
+            _emit_aipm_stage(f"{stage}｜请求 {attempt + 1}/{attempts}，等待接口响应")
             try:
                 response = cls.request(service_url, current)
                 content = cls.content(response)
                 if not content:
                     raise PromptAssistantError("远程服务返回空文本")
+                choices = response.get("choices") or []
+                if choices and choices[0].get("finish_reason") in {"length", "max_tokens"}:
+                    raise PromptAssistantError("提示词输出被接口截断；请提高输出预算或在规划阶段降低任务密度，不能使用残缺文本")
                 if validator is not None:
                     validator(content)
+                _emit_aipm_stage(f"{stage}｜响应校验通过")
                 return content, response
             except PromptAssistantError as exc:
                 last_error = exc
@@ -419,6 +443,11 @@ class OpenAICompatibleClient:
                     "role": "system",
                     "content": f"上一次输出未通过验收：{exc}。请只重新输出修正后的提示词纯文本，不要JSON、解释或代码围栏。",
                 })
+                # Retry a truncated text response with a bounded larger output budget.
+                if "截断" in str(exc) and isinstance(current.get("max_tokens"), int):
+                    budget = current["max_tokens"]
+                    if 0 < budget < 8192:
+                        current["max_tokens"] = min(8192, max(budget + 512, int(budget * 1.5)))
                 current["temperature"] = 0.1
                 current["cache_prompt"] = False
         raise PromptAssistantError(f"{stage}连续 {attempts} 次失败：{last_error}") from last_error
@@ -485,6 +514,7 @@ class ReferenceAnalysisPipeline:
             ).encode("utf-8")).hexdigest()
             analysis = cls._image_cache.get(cache_key)
             if analysis:
+                _emit_aipm_stage(f"参考图 {index + 1}/{len(images)}｜命中分析缓存")
                 cache_hits += 1
             else:
                 instruction = {
@@ -508,7 +538,8 @@ class ReferenceAnalysisPipeline:
                     "chat_template_kwargs": {"enable_thinking": False},
                 }
                 last_error: Exception | None = None
-                for _ in range(2):
+                for analysis_attempt in range(2):
+                    _emit_aipm_stage(f"参考图 {index + 1}/{len(images)}｜分析请求 {analysis_attempt + 1}/2，等待接口响应")
                     try:
                         response = OpenAICompatibleClient.request(service_url, payload, timeout=180.0)
                         analysis = OpenAICompatibleClient.content(response)
@@ -523,6 +554,7 @@ class ReferenceAnalysisPipeline:
                 if len(cls._image_cache) >= cls._cache_limit:
                     cls._image_cache.pop(next(iter(cls._image_cache)))
                 cls._image_cache[cache_key] = analysis
+            _emit_aipm_stage(f"参考图 {index + 1}/{len(images)}｜分析完成")
             profiles.append({
                 "picture_id": f"<Picture {index + 1}>",
                 "image_sha256": image["sha256"],
@@ -607,6 +639,8 @@ class AIPMVideoPrompt:
                 "修改意见": ("STRING", {"default": "", "multiline": True, "dynamicPrompts": False}),
                 "上次结果JSON": ("STRING", {"default": "", "multiline": True, "dynamicPrompts": False}),
                 "参考素材清单JSON": ("STRING", {"default": "[]", "multiline": True, "dynamicPrompts": False}),
+                "分段说明JSON": ("STRING", {"default": "[]", "multiline": True, "dynamicPrompts": False}),
+                "全局声音描述": ("STRING", {"default": "", "multiline": True, "dynamicPrompts": False}),
             },
         }
 
@@ -704,11 +738,12 @@ class AIPMVideoPrompt:
                 "global_negative_prompt": {"type": "string"},
                 "global_reference_ids": string_array,
                 "global_reference_bindings": string_array,
+                "planning_warnings": string_array,
                 "segments": {"type": "array", "items": segment,
                              "minItems": segment_count, "maxItems": segment_count},
             },
             "required": ["global_prompt", "global_negative_prompt", "global_reference_ids",
-                         "global_reference_bindings", "segments"],
+                         "global_reference_bindings", "planning_warnings", "segments"],
         }
         return {"type": "json_schema", "json_schema": {
             "name": "aipm_timeline_plan", "strict": True, "schema": schema,
@@ -780,8 +815,11 @@ class AIPMVideoPrompt:
         modification: str, video_assets: list[dict[str, Any]] | None = None,
         audio_assets: list[dict[str, Any]] | None = None,
         operation: str = "rewrite", base_package: dict[str, Any] | None = None,
-        target_segment_id: str = "",
+        target_segment_id: str = "", segment_instructions: list[str] | None = None,
+        global_sound_description: str = "",
     ):
+        global_sound_description = str(global_sound_description or "").strip()
+        segment_instructions = list(segment_instructions or [])[:segment_count]
         base_package = copy.deepcopy(base_package) if isinstance(base_package, dict) else None
         base_segments = copy.deepcopy(base_package.get("segments") or []) if base_package else []
         append_offset = len(base_segments) if operation == "append" else 0
@@ -803,6 +841,8 @@ class AIPMVideoPrompt:
             "service_model": service_model, "profile": profile, "mode": mode, "h3_contract_version": _h3_contract.VERSION,
             "idea": idea, "duration_seconds": duration_seconds,
             "segment_count": segment_count, "aspect_ratio": aspect_ratio,
+            "segment_instructions": segment_instructions,
+            "global_sound_description": global_sound_description,
             "requested_language": requested_language,
             "reference_ids": reference_ids,
         }, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
@@ -844,6 +884,20 @@ class AIPMVideoPrompt:
             ],
         }
         plan_context["h3_planning_rules"] = _h3_contract.planning_rules()
+        plan_context["inheritance_rules"] = _h3_contract.inheritance_rules()
+        if global_sound_description:
+            plan_context["global_sound_description"] = global_sound_description
+            plan_context.setdefault("rules", []).append("全局声音描述是声音设计的共同约束，落实到对白语言、音色、环境声、音乐及静音策略，不将声音要求改写成视觉动作；逐段明确例外只在对应段生效。")
+
+        plan_context["user_segment_instructions"] = [
+            {"segment_number": i + 1, "instruction": value}
+            for i, value in enumerate(segment_instructions) if value
+        ]
+        plan_context.setdefault("rules", []).extend([
+            "user_segment_instructions逐项对应本次请求的分段；明确要求优先于自动补充，留空才自动规划。不得将某段专属动作或台词挪给其他段。",
+            "每段opening_state/ending_state写明人物位置朝向、手与物体接触、道具位置、动作阶段和持续声音；延长段的起始状态必须承接上一段结束状态。",
+        ])
+
         if mode == "h3_keyframe":
             frame_count = max(1, round(duration_seconds * 24))
             plan_context["keyframe_rules"] = [
@@ -961,6 +1015,13 @@ class AIPMVideoPrompt:
                 } for index in range(segment_count)],
             }
             plan_response = {"usage": {}, "aipm_fallback": "local_timeline_plan"}
+        inheritance_warnings = _h3_contract.inheritance_warnings(idea, global_sound_description, segment_instructions)
+        inherited_plan_warnings = plan.get("planning_warnings") or []
+        if isinstance(inherited_plan_warnings, list):
+            inheritance_warnings.extend(str(v) for v in inherited_plan_warnings if str(v).strip())
+        inheritance_warnings = list(dict.fromkeys(inheritance_warnings))
+        for warning in inheritance_warnings:
+            _emit_aipm_stage("规划提示｜" + warning)
         normalize_plan_mode(plan, mode)
         segments_plan = plan.get("segments") if isinstance(plan.get("segments"), list) else []
         # Deterministic user policy, also applied to fallback and resumed plans.
@@ -1072,6 +1133,14 @@ class AIPMVideoPrompt:
                     "按segment_plan.keyframe_transitions逐区间描述相邻图片之间连续、物理可行的画面变化过程，不能只罗列静态图片",
                     "关键帧图片由Add Guide按帧注入，不是Ref2VA参考；提示词禁止输出<Picture N>或<Subject N>媒体标签，改用‘第N张关键帧图像’和具体帧号描述",
                 ])
+            if global_sound_description:
+                prompt_context["global_sound_description"] = global_sound_description
+                prompt_context["rules"].append("本段必须落实全局声音描述，并保持延长段的持续声场、说话人和音色一致；明确禁止的音乐或声音不得自动补充。")
+            prompt_context["rules"].append("生成分段编号与镜头编号是两套编号：每个分段的镜头编号都从[Shot 1]重新开始，不能沿用上一分段的[Shot 2]/[Shot 3]。视频延长也不等于切镜。单一连续镜头只写[Shot 1]；只有本分段内确实发生切镜才写[Shot 2]等，并使用At MM:SS.mmm指定该分段内的递增切镜时间。不得为通过格式校验而凭空增加切镜。")
+            prompt_context["user_segment_instruction"] = segment_instructions[index] if index < len(segment_instructions) else ""
+            prompt_context["previous_end_state"] = str(prior_segment.get("end_state") or "")
+            prompt_context["rules"].extend(_h3_contract.inheritance_rules())
+            prompt_context["rules"].append("逐段说明仅明确属性覆盖全局，其余继承；延长时保持previous_end_state中的动作接触与物体位置，不重新开始已完成动作。")
             example_name, example_text = _h3_contract.selected_example(
                 SKILLS_DIR / "aipm-minimax-h3-video", mode, idea + (" motion_context continuation" if segment_plan.get("transition") == "motion_context" else ""), bool(audio_count),
             )
@@ -1085,7 +1154,7 @@ class AIPMVideoPrompt:
                     {"role": "system", "content": "你是MiniMax H3提示词导演。只返回当前分段的完整提示词纯文本。"},
                     {"role": "user", "content": [{"type": "text", "text": json.dumps(prompt_context, ensure_ascii=False)}]},
                 ],
-                "temperature": 0.25, "max_tokens": 3200, "cache_prompt": True,
+                "temperature": 0.1, "max_tokens": 3200, "cache_prompt": True,
                 "chat_template_kwargs": {"enable_thinking": False},
             }
             planned_dialogue = [
@@ -1119,7 +1188,7 @@ class AIPMVideoPrompt:
                         raise PromptAssistantError(f"关键帧提示词没有明确描述帧位：{missing_frames}")
             try:
                 segment_prompt, segment_response = OpenAICompatibleClient.request_text(
-                    service_url, text_payload, f"{segment_id} 提示词生成", attempts=2,
+                    service_url, text_payload, f"分段 {index + 1}/{len(segments_plan)}（{segment_id}）提示词生成", attempts=2,
                     validator=validate_segment_text,
                 )
                 source_prompt = segment_prompt
@@ -1195,7 +1264,7 @@ class AIPMVideoPrompt:
             "generation_status": "complete" if complete else "interrupted",
             "h3_contract_version": _h3_contract.VERSION,
             "planning_status": "degraded" if plan_response.get("aipm_fallback") else "planned",
-            "planning_warnings": ["远程规划不可用，使用本地占位规划；未强加写实风格或文字负向词，请复核分段与台词。"] if plan_response.get("aipm_fallback") else [],
+            "planning_warnings": inheritance_warnings + (["远程规划不可用，使用本地占位规划；未强加写实风格或文字负向词，请复核分段与台词。"] if plan_response.get("aipm_fallback") else []),
             "resume_key": resume_key,
             "resume_from_segment": None if complete else len(segment_results) + 1,
             "failed_segment_id": failed_segment_id,
@@ -1291,7 +1360,7 @@ class AIPMVideoPrompt:
             policy_segment["transition"] = "cut" if policy_index == 0 else "motion_context"
         package["h3_contract_version"] = _h3_contract.VERSION
         package["planning_status"] = "degraded" if plan_response.get("aipm_fallback") else "planned"
-        package["planning_warnings"] = ["远程规划不可用，采用本地占位规划，请复核分段、素材与帧位；未强加写实风格或文字负向词。"] if plan_response.get("aipm_fallback") else []
+        package["planning_warnings"] = list(dict.fromkeys(inheritance_warnings + (["远程规划不可用，采用本地占位规划，请复核分段、素材与帧位；未强加写实风格或文字负向词。"] if plan_response.get("aipm_fallback") else [])))
         cine_timeline, cine_timeline_json = self._canonical_timeline(package)
         return {"ui": {"text": [package["video_prompt"], package["negative_prompt"], cine_timeline_json]},
                 "result": (
@@ -1303,7 +1372,7 @@ class AIPMVideoPrompt:
                  视频时长, 构图比例, 提示词语言, 分段数量, image1=None, image2=None,
                  image3=None, image4=None, image5=None, image6=None, image7=None, image8=None, image9=None,
                  video1=None, video2=None, video3=None, audio1=None, audio2=None, audio3=None,
-                 修改意见="", 上次结果JSON="", 参考素材清单JSON="[]"):
+                 修改意见="", 上次结果JSON="", 参考素材清单JSON="[]", 分段说明JSON="[]", 全局声音描述=""):
         idea = str(视频内容与导演要求 or "").strip()
         if not idea:
             raise PromptAssistantError("请先填写视频内容与导演要求")
@@ -1320,6 +1389,13 @@ class AIPMVideoPrompt:
             segment_count = max(1, min(12, int(分段数量)))
         except (TypeError, ValueError):
             segment_count = 1
+        try:
+            segment_instructions = json.loads(str(分段说明JSON or "[]"))
+        except (TypeError, ValueError) as exc:
+            raise PromptAssistantError("分段说明格式无效，请重新保存分段说明") from exc
+        if not isinstance(segment_instructions, list) or any(not isinstance(v, str) for v in segment_instructions):
+            raise PromptAssistantError("分段说明必须是文本列表")
+        segment_instructions = [v.strip() for v in segment_instructions[:segment_count]]
         modification = str(修改意见 or "").strip()
         previous_json = str(上次结果JSON or "").strip()
         operation = "rewrite"
@@ -1503,6 +1579,8 @@ class AIPMVideoPrompt:
             previous=previous, modification=modification,
             video_assets=video_assets, audio_assets=audio_assets,
             operation=operation, base_package=base_package,
+            segment_instructions=segment_instructions,
+            global_sound_description=str(全局声音描述 or "").strip(),
             target_segment_id=target_segment_id,
         )
 
