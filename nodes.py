@@ -639,8 +639,6 @@ class AIPMVideoPrompt:
                 "修改意见": ("STRING", {"default": "", "multiline": True, "dynamicPrompts": False}),
                 "上次结果JSON": ("STRING", {"default": "", "multiline": True, "dynamicPrompts": False}),
                 "参考素材清单JSON": ("STRING", {"default": "[]", "multiline": True, "dynamicPrompts": False}),
-                "分段说明JSON": ("STRING", {"default": "[]", "multiline": True, "dynamicPrompts": False}),
-                "全局声音描述": ("STRING", {"default": "", "multiline": True, "dynamicPrompts": False}),
             },
         }
 
@@ -754,6 +752,10 @@ class AIPMVideoPrompt:
         text = str(prompt or "").strip()
         if not text:
             raise PromptAssistantError("提示词为空")
+        try:
+            _h3_contract.validate_description_language(text, requested_language)
+        except _h3_contract.ContractError as exc:
+            raise PromptAssistantError(str(exc)) from exc
         if requested_language != "English" and len(re.findall(r"[\u3400-\u9fff]", text)) < 30:
             raise PromptAssistantError("中文模式下描述正文必须使用中文，只有H3官方语法保留英文")
 
@@ -815,11 +817,8 @@ class AIPMVideoPrompt:
         modification: str, video_assets: list[dict[str, Any]] | None = None,
         audio_assets: list[dict[str, Any]] | None = None,
         operation: str = "rewrite", base_package: dict[str, Any] | None = None,
-        target_segment_id: str = "", segment_instructions: list[str] | None = None,
-        global_sound_description: str = "",
+        target_segment_id: str = "",
     ):
-        global_sound_description = str(global_sound_description or "").strip()
-        segment_instructions = list(segment_instructions or [])[:segment_count]
         base_package = copy.deepcopy(base_package) if isinstance(base_package, dict) else None
         base_segments = copy.deepcopy(base_package.get("segments") or []) if base_package else []
         append_offset = len(base_segments) if operation == "append" else 0
@@ -841,8 +840,6 @@ class AIPMVideoPrompt:
             "service_model": service_model, "profile": profile, "mode": mode, "h3_contract_version": _h3_contract.VERSION,
             "idea": idea, "duration_seconds": duration_seconds,
             "segment_count": segment_count, "aspect_ratio": aspect_ratio,
-            "segment_instructions": segment_instructions,
-            "global_sound_description": global_sound_description,
             "requested_language": requested_language,
             "reference_ids": reference_ids,
         }, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
@@ -869,6 +866,7 @@ class AIPMVideoPrompt:
             "target_segment": base_segments[target_index] if target_index >= 0 else None,
             "promotion_rules": [
                 "只有在全部分段都使用且属性保持一致的人物、服装、场景或参考才提升到全局",
+                "global_prompt只写共同身份、场景、风格与声音设定，不写具体段落动作、对白、剧情梗概或事件时间线；有先后顺序的事件只分配到各段brief中。",
                 "人物身份可全局但换装可留在分段；参考绑定必须写明继承属性和排除属性",
                 "若没有共同人物服装场景，全局只保留画面风格、画质、色彩、摄影语言、声音规范和公共负向约束",
                 "每个分段只列本段额外需要的参考；不得把未使用参考塞入全局",
@@ -885,16 +883,8 @@ class AIPMVideoPrompt:
         }
         plan_context["h3_planning_rules"] = _h3_contract.planning_rules()
         plan_context["inheritance_rules"] = _h3_contract.inheritance_rules()
-        if global_sound_description:
-            plan_context["global_sound_description"] = global_sound_description
-            plan_context.setdefault("rules", []).append("全局声音描述是声音设计的共同约束，落实到对白语言、音色、环境声、音乐及静音策略，不将声音要求改写成视觉动作；逐段明确例外只在对应段生效。")
-
-        plan_context["user_segment_instructions"] = [
-            {"segment_number": i + 1, "instruction": value}
-            for i, value in enumerate(segment_instructions) if value
-        ]
         plan_context.setdefault("rules", []).extend([
-            "user_segment_instructions逐项对应本次请求的分段；明确要求优先于自动补充，留空才自动规划。不得将某段专属动作或台词挪给其他段。",
+            "按整体描述的事件顺序规划各段；只把本段动作与对白写进本段，前段内容用于衔接。",
             "每段opening_state/ending_state写明人物位置朝向、手与物体接触、道具位置、动作阶段和持续声音；延长段的起始状态必须承接上一段结束状态。",
         ])
 
@@ -911,7 +901,7 @@ class AIPMVideoPrompt:
         plan_payload = {
             "model": service_model,
             "messages": [
-                {"role": "system", "content": "你是影视时间线规划师。只输出小型规划JSON，不写完整提示词。"},
+                {"role": "system", "content": "你是影视时间线规划师。只输出小型规划JSON，不写完整提示词。" + _h3_contract.description_language_rule(requested_language)},
                 {"role": "user", "content": [{"type": "text", "text": json.dumps(plan_context, ensure_ascii=False)}]},
             ],
             "temperature": 0.2, "max_tokens": min(6000, 1400 + segment_count * 550),
@@ -1015,7 +1005,7 @@ class AIPMVideoPrompt:
                 } for index in range(segment_count)],
             }
             plan_response = {"usage": {}, "aipm_fallback": "local_timeline_plan"}
-        inheritance_warnings = _h3_contract.inheritance_warnings(idea, global_sound_description, segment_instructions)
+        inheritance_warnings = []
         inherited_plan_warnings = plan.get("planning_warnings") or []
         if isinstance(inherited_plan_warnings, list):
             inheritance_warnings.extend(str(v) for v in inherited_plan_warnings if str(v).strip())
@@ -1095,16 +1085,20 @@ class AIPMVideoPrompt:
             history_segments = (base_segments if operation == "append" else []) + segment_results
             previous_definitions = _h3_contract.subject_history(history_segments)
             previous_roles = _h3_contract.internal_role_bindings(history_segments)
+            camera_context = (_h3_contract.previous_shot_context(prior_segment)
+                              if segment_plan.get("transition") == "motion_context" else {})
+            # Prior narrative is not a camera state and can be copied as this segment.
+            camera_context.pop("visual_description", None)
+            if camera_context:
+                camera_context["rule"] = "仅继承明确结尾状态；未记录的机位与运动参数保持未知，不回放上一段事件。"
             prompt_context = {
                 "previous_subject_definitions": (_h3_contract.subject_only_prompt(previous_definitions, previous_roles)
                                                  if mode == "h3_ref2va" else previous_definitions),
                 "previous_role_bindings": previous_roles,
-                "previous_camera_context": (_h3_contract.previous_shot_context(prior_segment)
-                                            if segment_plan.get("transition") == "motion_context" else {}),
+                "previous_camera_context": camera_context,
                 "task": "只生成当前分段可直接执行的MiniMax H3提示词纯文本",
                 "professional_skill": skill, "target_model": profile, "mode": mode,
                 "language": requested_language, "aspect_ratio": aspect_ratio,
-                "original_idea": idea,
                 "segment_id": segment_id, "duration_seconds": duration_seconds,
                 "global_prompt_is_upstream": True, "global_prompt_context": global_prompt,
                 "global_reference_ids": global_reference_ids,
@@ -1114,6 +1108,7 @@ class AIPMVideoPrompt:
                 "previous_segment_end": previous_end,
                 "rules": [
                     "输出纯文本，不输出JSON、Markdown或解释",
+                    "segment_plan是本段动作与对白的唯一时间范围。前段资料仅用于保持身份、机位和衔接状态，不作为本段需要重新发生的事件。必须覆盖本段brief和ending_state，不复述前段剧情。",
                     "Ref2VA机器提示词只用Subject指代人物，不输出姓名、角色名字段或括号别名；定义保留Subject、实际启用参考来源和必要外貌服装。姓名仅用于输入规划及内部previous_role_bindings，换主体、接触对象或发言时重标Subject。台词及可见文字中的姓名原样保留；Base和Add Guide模式不用Subject标签。",
                     "连续延长时读取previous_camera_context的末镜头机位、景别、移动方向、目标及运动阶段，接续而非重启运镜；这是前段文字意图，不是实测画面。未提供的数值不得编造。每个阶段只安排一个主要运镜，区分横移与摇镜、推进与变焦；速度变化需有过程。",
                     "逐次发言写清当前说话者及可见听者状态：非合说时只有当前说话者做语言性口型，其他人双唇自然闭合，以视线和身体回应；说完闭口，再由下一人开口。非语言发声、唱歌和用户明确合说按其实际阶段处理，不能把闭口规则覆盖到这些事件。",
@@ -1133,12 +1128,8 @@ class AIPMVideoPrompt:
                     "按segment_plan.keyframe_transitions逐区间描述相邻图片之间连续、物理可行的画面变化过程，不能只罗列静态图片",
                     "关键帧图片由Add Guide按帧注入，不是Ref2VA参考；提示词禁止输出<Picture N>或<Subject N>媒体标签，改用‘第N张关键帧图像’和具体帧号描述",
                 ])
-            if global_sound_description:
-                prompt_context["global_sound_description"] = global_sound_description
-                prompt_context["rules"].append("本段必须落实全局声音描述，并保持延长段的持续声场、说话人和音色一致；明确禁止的音乐或声音不得自动补充。")
             prompt_context["rules"].append("生成分段编号与镜头编号是两套编号：每个分段的镜头编号都从[Shot 1]重新开始，不能沿用上一分段的[Shot 2]/[Shot 3]。视频延长也不等于切镜。单一连续镜头只写[Shot 1]；只有本分段内确实发生切镜才写[Shot 2]等，并使用At MM:SS.mmm指定该分段内的递增切镜时间。不得为通过格式校验而凭空增加切镜。")
-            prompt_context["user_segment_instruction"] = segment_instructions[index] if index < len(segment_instructions) else ""
-            prompt_context["previous_end_state"] = str(prior_segment.get("end_state") or "")
+            prompt_context["previous_end_state"] = str(prior_segment.get("ending_state") or "")
             prompt_context["rules"].extend(_h3_contract.inheritance_rules())
             prompt_context["rules"].append("逐段说明仅明确属性覆盖全局，其余继承；延长时保持previous_end_state中的动作接触与物体位置，不重新开始已完成动作。")
             example_name, example_text = _h3_contract.selected_example(
@@ -1151,7 +1142,7 @@ class AIPMVideoPrompt:
             text_payload = {
                 "model": service_model,
                 "messages": [
-                    {"role": "system", "content": "你是MiniMax H3提示词导演。只返回当前分段的完整提示词纯文本。"},
+                    {"role": "system", "content": "你是MiniMax H3提示词导演。只返回当前分段的完整提示词纯文本。" + _h3_contract.description_language_rule(requested_language)},
                     {"role": "user", "content": [{"type": "text", "text": json.dumps(prompt_context, ensure_ascii=False)}]},
                 ],
                 "temperature": 0.1, "max_tokens": 3200, "cache_prompt": True,
@@ -1169,6 +1160,14 @@ class AIPMVideoPrompt:
             def validate_segment_text(text: str) -> None:
                 self.validate_prompt_text(text, requested_language)
                 self.validate_h3_structure(text, mode, duration_seconds)
+                if prior_segment and not repeated_segments_allowed:
+                    fields = dict(_h3_contract.sections(text))
+                    prior_fields = dict(_h3_contract.sections(str(prior_segment.get("source_prompt") or "")))
+                    body_key = "detailed_description" if mode == "h3_ref2va" else "integrated_multimodal_description"
+                    current_body = re.sub(r"\s+", "", fields.get(body_key, ""))
+                    prior_body = re.sub(r"\s+", "", prior_fields.get(body_key, ""))
+                    if len(current_body) > 200 and current_body == prior_body:
+                        raise PromptAssistantError("当前段动作正文与上一段完全重复；请根据当前segment_plan的brief和结尾重新生成本段，前段仅作衔接，不能复述。")
                 try:
                     _h3_contract.validate_segment(text, planned_dialogue, active_refs, mode)
                 except _h3_contract.ContractError as exc:
@@ -1372,7 +1371,7 @@ class AIPMVideoPrompt:
                  视频时长, 构图比例, 提示词语言, 分段数量, image1=None, image2=None,
                  image3=None, image4=None, image5=None, image6=None, image7=None, image8=None, image9=None,
                  video1=None, video2=None, video3=None, audio1=None, audio2=None, audio3=None,
-                 修改意见="", 上次结果JSON="", 参考素材清单JSON="[]", 分段说明JSON="[]", 全局声音描述=""):
+                 修改意见="", 上次结果JSON="", 参考素材清单JSON="[]"):
         idea = str(视频内容与导演要求 or "").strip()
         if not idea:
             raise PromptAssistantError("请先填写视频内容与导演要求")
@@ -1389,13 +1388,6 @@ class AIPMVideoPrompt:
             segment_count = max(1, min(12, int(分段数量)))
         except (TypeError, ValueError):
             segment_count = 1
-        try:
-            segment_instructions = json.loads(str(分段说明JSON or "[]"))
-        except (TypeError, ValueError) as exc:
-            raise PromptAssistantError("分段说明格式无效，请重新保存分段说明") from exc
-        if not isinstance(segment_instructions, list) or any(not isinstance(v, str) for v in segment_instructions):
-            raise PromptAssistantError("分段说明必须是文本列表")
-        segment_instructions = [v.strip() for v in segment_instructions[:segment_count]]
         modification = str(修改意见 or "").strip()
         previous_json = str(上次结果JSON or "").strip()
         operation = "rewrite"
@@ -1499,7 +1491,7 @@ class AIPMVideoPrompt:
                 if not isinstance(candidate, dict) or not candidate.get("video_prompt"):
                     raise PromptAssistantError("没有可用于修改的上次有效结果")
                 previous = candidate if operation == "rewrite" else None
-            elif isinstance(candidate, dict) and candidate.get("generation_status") == "interrupted":
+            elif previous is None and isinstance(candidate, dict) and candidate.get("generation_status") == "interrupted":
                 previous = candidate
 
         asset_manifest = parse_reference_asset_manifest(参考素材清单JSON)
@@ -1579,8 +1571,6 @@ class AIPMVideoPrompt:
             previous=previous, modification=modification,
             video_assets=video_assets, audio_assets=audio_assets,
             operation=operation, base_package=base_package,
-            segment_instructions=segment_instructions,
-            global_sound_description=str(全局声音描述 or "").strip(),
             target_segment_id=target_segment_id,
         )
 

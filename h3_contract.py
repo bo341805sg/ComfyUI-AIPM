@@ -160,6 +160,8 @@ def bind_dialogue(text, planned):
     return ''.join(output)
 
 def validate_segment(text, planned, active_references, mode):
+    if planned and not DIALOGUE.search(text):
+        raise ContractError('本段已有明确对白计划，却缺少实际台词标签；必须将每句原文写入<d>[Language]原文</d>，不能仅描述人物说话。')
     bound = bind_dialogue(text,planned)
     parts = dict(sections(bound))
     body = parts.get('detailed_description', parts.get('integrated_multimodal_description',bound))
@@ -183,7 +185,7 @@ def validate_segment(text, planned, active_references, mode):
     defined=set(re.findall(r'(?m)^\s*(<Subject\s+\d+>)',definitions))
     subjects=set(re.findall(r'<Subject\s+\d+>',text))
     if subjects-defined:
-        raise ContractError('H3使用了未定义的Subject标签')
+        raise ContractError('H3使用了未定义的Subject标签：'+', '.join(sorted(subjects-defined))+'。请在本段 subject_definitions 中逐行定义实际使用的标签，并沿用已有身份和有效参考；无法绑定时移除该未定义引用。')
     retention=parts.get('retention_analysis','')
     for label in subjects | {item for item in used if item.startswith('<Audio ')}:
         if label not in retention:
@@ -412,22 +414,20 @@ def inheritance_rules():
     ]
 
 
-def inheritance_warnings(idea, sound, instructions):
-    """Conservative explicit music conflicts; other semantics are planner-reviewed."""
-    def music_policy(text):
-        text = str(text)
-        if re.search(r'无配乐|无音乐|不要(?:背景)?音乐|禁止(?:背景)?音乐|no (?:background )?music|no score|without music', text, re.I):
-            return 'off'
-        if re.search(r'添加(?:背景)?音乐|加入(?:背景)?音乐|加配乐|加入配乐|播放(?:背景)?音乐|add (?:background )?music|with (?:a )?score', text, re.I):
-            return 'on'
-        return None
-    a, b = music_policy(idea), music_policy(sound)
-    warnings = []
-    if a and b and a != b:
-        warnings.append('全局冲突：整体描述与全局声音的配乐要求相反；请复核，不能静默忽略任一要求。')
-    global_policy = b or a
-    for i, local in enumerate(instructions):
-        policy = music_policy(local)
-        if global_policy and policy and policy != global_policy:
-            warnings.append(f'第{i+1}段声音覆盖：全局配乐为{global_policy}，本段明确要求{policy}；仅本段按逐段说明执行，其他段继承全局。')
-    return warnings
+def description_language_rule(language):
+    target = "English" if language == "English" else "Chinese"
+    return (f"Description language is {target}, selected by the UI. This applies to global visual prose, "
+            "subject definitions, action, camera and sound descriptions. Dialogue language is independent: "
+            "preserve user-specified dialogue/lyrics in their original language inside <d>[Language]words</d>. "
+            "A request for Chinese/Mandarin speech never changes English visual or sound prose. "
+            "Preserve literal visible text and spoken names. English descriptions with Chinese dialogue are valid.")
+
+
+def validate_description_language(text, language):
+    if language != 'English':
+        return
+    prose = DIALOGUE.sub('', str(text))
+    # Literal signage/branding may retain the user's original script.
+    prose = re.sub(r'“[^”]*”|「[^」]*」|"[^"\n]*"', '', prose)
+    if len(re.findall(r'[\u3400-\u9fff]', prose)) >= 12:
+        raise ContractError('已选择English，动作、镜头、场景和声音正文必须为英文；仅对白/歌词及画面文字保留原语言，中文对白使用<d>[Chinese]原文</d>。')

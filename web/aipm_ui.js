@@ -583,8 +583,8 @@ function installGeneratePanel(node) {
     widget.options.serialize = false;
     return widget;
   };
-  const operationLabels = { rewrite: "重写时间轴", append: "续写时间轴" };
-  const operationFromLabel = (value) => value === operationLabels.append ? "append" : "rewrite";
+  const operationLabels = { rewrite: "重写时间轴（分段数量为总数）", append: "续写时间轴（分段数量为新增数）" };
+  const operationFromLabel = (value) => [operationLabels.append, "续写时间轴"].includes(value) ? "append" : "rewrite";
   let operationSelect = null;
   let targetSelect = null;
   const targetIdsByLabel = new Map();
@@ -717,7 +717,9 @@ function installGeneratePanel(node) {
     // let their callbacks explain missing prerequisites in the status widget.
     reviseButton.disabled = false;
     cacheButton.disabled = false;
-    if (!requestState.running && hasInterruptedVideo()) button.name = "继续生成";
+    if (!requestState.running) {
+      button.name = isRefinement ? "分析并细化" : hasInterruptedVideo() ? "继续生成" : "生成 / 重新创作";
+    }
     refreshSegmentTargets();
   };
 
@@ -1089,6 +1091,8 @@ function installGeneratePanel(node) {
   });
   const failed = scopeEvent(({ detail }) => {
     requestState.running = false;
+    delete node.properties.aipm_pending_request;
+    savePending(null);
     button.disabled = false;
     reviseButton.disabled = false;
     cacheButton.disabled = false;
@@ -1117,6 +1121,8 @@ function installGeneratePanel(node) {
         acceptResult(outputs[candidates[0]]);
       } else if(history.status?.completed || history.status?.status_str==="error") {
         requestState.running=false;
+        delete node.properties.aipm_pending_request;
+        savePending(null);
         button.disabled=reviseButton.disabled=cacheButton.disabled=clearButton.disabled=false;
         updateRevisionAvailability();
         setStatus(`任务 ${promptId} 已结束，历史中未找到该节点的有效结果。请检查任务错误；没有自动重新提交。`,"error");
@@ -1221,110 +1227,66 @@ function installGeneratePanel(node) {
   });
 }
 
-function removeSegmentInstructionPanel(node) {
-  node._aipmSegmentResizeObserver?.disconnect();
-  node._aipmSegmentResizeObserver = null;
-  for (const widget of node._aipmSegmentEditors || []) {
-    widget.onRemove?.();
-    (widget.inputEl || widget.element)?.remove?.();
-    node.widgets = (node.widgets || []).filter(item => item !== widget);
-  }
-  node._aipmSegmentEditors = [];
-  const legacy = node._aipmSegmentInstructionWidget;
-  if (legacy) {
-    legacy.element?.remove?.();
-    node.widgets = (node.widgets || []).filter(item => item !== legacy);
-    node._aipmSegmentInstructionWidget = null;
-  }
-}
-
-function installSegmentInstructionPanel(node) {
+function configureVideoDescription(node) {
   if (String(node.comfyClass || node.type) !== "AIPMVideoPrompt") return;
-  removeSegmentInstructionPanel(node);
-  let storage = node.widgets?.find(w => w.name === "分段说明JSON");
-  if (!storage) storage = node.addWidget("text", "分段说明JSON", "[]", () => {}, {});
-  hideInternalWidget(storage);
-  storage.draw = () => {};
-  const internal = storage.inputEl || storage.element;
-  if (internal?.style) internal.style.display = "none";
-  let soundStorage = node.widgets?.find(w => w.name === "全局声音描述");
-  if (!soundStorage) soundStorage = ComfyWidgets.STRING(node,"全局声音描述",["STRING",{default:"",multiline:true,dynamicPrompts:false}],app).widget;
-  hideInternalWidget(soundStorage);
-  soundStorage.draw = () => {};
-  const soundInternal = soundStorage.inputEl || soundStorage.element;
-  if (soundInternal?.style) soundInternal.style.display = "none";
-  const countWidget = node.widgets?.find(w => w.name === "分段数量");
-  const globalInput = node.widgets?.find(w => w.name === "视频内容与导演要求");
-  // Keep the original backend STRING widget, including ComfyUI's native styling.
-  if (globalInput) {
-    globalInput.computeSize = width => [width, 180];
-    globalInput.options ||= {};
-    globalInput.options.minHeight = 180;
-    globalInput.options.maxHeight = 180;
-  }
-  const read = () => {
-    try { const value=JSON.parse(String(storage.value || "[]")); return Array.isArray(value) ? value.map(String) : []; }
-    catch { return []; }
-  };
-  const render = () => {
-    removeSegmentInstructionPanel(node);
-    const values=read();
-    const count=Math.max(1,Math.min(12,Number(countWidget?.value)||1));
-    let insertAt = node.widgets.indexOf(globalInput) + 1;
-    // Display a native editor here; retain serialized backend input at its original position.
-    const soundEditor=ComfyWidgets.STRING(node,"全局声音描述（选填）",["STRING",{default:String(soundStorage.value||""),multiline:true,dynamicPrompts:false}],app).widget;
-    soundEditor.serialize=false;
-    soundEditor.options ||= {};
-    Object.assign(soundEditor.options,{serialize:false,minHeight:110,maxHeight:110});
-    soundEditor.computeSize=width=>[width,110];
-    soundEditor.value=String(soundStorage.value||"");
-    const commitSound=()=>{soundStorage.value=String(soundEditor.value||"");node.graph?.change?.();};
-    const soundCallback=soundEditor.callback;
-    soundEditor.callback=function(...args){const result=soundCallback?.apply(this,args);commitSound();return result;};
-    const soundElement=soundEditor.inputEl||soundEditor.element;
-    if(soundElement){soundElement.placeholder="对白语言、音色、环境声、音乐或静音要求；留空沿用整体要求";soundElement.addEventListener("input",()=>{soundEditor.value=soundElement.value;commitSound();});}
-    node.widgets.splice(node.widgets.indexOf(soundEditor),1);
-    node.widgets.splice(insertAt++,0,soundEditor);
-    node._aipmSegmentEditors.push(soundEditor);
-
-    for (let i=0; i<count; i++) {
-      const widget=ComfyWidgets.STRING(node,`第 ${i+1} 段说明（选填）`,["STRING",{default:values[i]||"",multiline:true,dynamicPrompts:false}],app).widget;
-      widget.serialize=false;
-      widget.options ||= {};
-      widget.options.serialize=false;
-      widget.options.minHeight=110;
-      widget.options.maxHeight=110;
-      widget.computeSize=width=>[width,110];
-      widget.value=values[i]||"";
-      const commit=()=>{ const all=read(); while(all.length<=i)all.push(""); all[i]=String(widget.value||""); storage.value=JSON.stringify(all); node.graph?.change?.(); };
-      const original=widget.callback;
-      widget.callback=function(...args){ const result=original?.apply(this,args); commit(); return result; };
-      const element=widget.inputEl || widget.element;
-      if(element){
-        element.placeholder="动作、对白、镜头或结束状态；留空自动规划";
-        element.addEventListener("input",()=>{widget.value=element.value;commit();});
-      }
-      node.widgets.splice(node.widgets.indexOf(widget),1);
-      node.widgets.splice(insertAt++,0,widget);
-      node._aipmSegmentEditors.push(widget);
+  const globalInput = node.widgets?.find(widget => widget.name === "视频内容与导演要求");
+  if (!globalInput) return;
+  const element = globalInput.inputEl || globalInput.element;
+  const minHeight = 100;
+  const height = () => Math.max(minHeight, Number(node.properties?.aipm_description_height) || 260);
+  // Reserve a gap below the textarea in the canvas layout, including while dragging.
+  const slotHeight = () => height() + 12;
+  globalInput.computeSize = width => [width, slotHeight()];
+  globalInput.options ||= {};
+  globalInput.options.getMinHeight = slotHeight;
+  globalInput.options.getMaxHeight = slotHeight;
+  const fitNode = () => {
+    globalInput.options.minHeight = slotHeight();
+    globalInput.options.maxHeight = slotHeight();
+    if (element?.style) {
+      const editorHeight = `${height()}px`;
+      element.style.boxSizing = "border-box";
+      element.style.height = editorHeight;
+      element.style.minHeight = editorHeight;
+      element.style.maxHeight = editorHeight;
     }
-    requestAnimationFrame(()=>{
-      if (node.graph) node.arrange?.();
-      const minimum = node.computeSize?.();
-      if (minimum && Number.isFinite(Number(minimum[1]))) {
-        const width = Math.max(AIPM_MIN_WIDTH, Number(node.size?.[0]) || Number(minimum[0]));
-        node.setSize?.([width, Number(minimum[1])]);
-      }
-      node.setDirtyCanvas?.(true,true);
-    });
+    const width = Number(node.size?.[0]) || AIPM_MIN_WIDTH;
+    const measured = Number(node.computeSize?.([width, 0])?.[1]);
+    if (Number.isFinite(measured) && measured > 0) node.setSize?.([width, measured]);
+    node.arrange?.();
+    node.setDirtyCanvas?.(true, true);
   };
-  if(countWidget && !countWidget._aipmSegmentCallback){
-    const original=countWidget.callback;
-    countWidget.callback=function(...args){const result=original?.apply(this,args);node._aipmRefreshSegmentInstructions?.();return result;};
-    countWidget._aipmSegmentCallback=true;
+  if (element && !element._aipmDescriptionResize) {
+    element._aipmDescriptionResize = true;
+    element.placeholder = "填写完整剧情、动作、对白和声音要求。拖动右下角调整高度";
+    element.style.resize = "vertical";
+    let drag = null;
+    element.addEventListener("pointerdown", event => {
+      const rect = element.getBoundingClientRect();
+      const scale = rect.height / (element.offsetHeight || height()) || 1;
+      if (event.button !== 0 || rect.right - event.clientX > 18 * scale
+          || rect.bottom - event.clientY > 18 * scale) return;
+      event.preventDefault();
+      event.stopPropagation();
+      drag = { id: event.pointerId, y: event.clientY, height: height(), scale };
+      element.setPointerCapture(event.pointerId);
+    });
+    element.addEventListener("pointermove", event => {
+      if (drag?.id !== event.pointerId) return;
+      event.stopPropagation();
+      node.properties ||= {};
+      node.properties.aipm_description_height = Math.max(
+        minHeight, Math.round(drag.height + (event.clientY - drag.y) / drag.scale),
+      );
+      fitNode();
+    });
+    element.addEventListener("lostpointercapture", () => {
+      if (!drag) return;
+      drag = null;
+      node.graph?.change?.();
+    });
   }
-  node._aipmRefreshSegmentInstructions=render;
-  render();
+  requestAnimationFrame(fitNode);
 }
 
 app.registerExtension({
@@ -1337,7 +1299,6 @@ app.registerExtension({
       // Workflow values are restored positionally. Runtime-only controls may
       // already have been added by onNodeCreated, so remove them before the
       // core loader assigns widgets_values, then rebuild them afterwards.
-      removeSegmentInstructionPanel(this);
       removeOldPanel(this);
       const result = originalConfigure?.apply(this, arguments);
       migrateReferenceInputNames(this);
@@ -1351,7 +1312,7 @@ app.registerExtension({
       migrateVideoDurationWidget(this);
       configureStableNodeLayout(this);
       installGeneratePanel(this);
-      installSegmentInstructionPanel(this);
+      configureVideoDescription(this);
       return result;
     };
     const original = nodeType.prototype.onNodeCreated;
@@ -1381,7 +1342,7 @@ app.registerExtension({
         migrateVideoDurationWidget(this);
         configureStableNodeLayout(this);
         installGeneratePanel(this);
-        installSegmentInstructionPanel(this);
+        configureVideoDescription(this);
       });
       return result;
     };
