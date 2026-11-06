@@ -27,6 +27,13 @@ class H3ContractTests(unittest.TestCase):
         self.assertFalse(h3.content_warnings(text, ['母亲：等一下。']))
         h3.validate_segment(text, ['母亲：等一下。'], [], 'text_to_video')
 
+    def test_source_shot_reference_is_not_a_new_cut(self):
+        h3.validate_structure(base('[Shot 1] 承接前段 (from [Shot 5])，继续行走。'), 'text_to_video', 8)
+
+    def test_segment_six_still_requires_local_shot_one(self):
+        with self.assertRaises(h3.ContractError):
+            h3.validate_structure(base('[Shot 6] 继续行走。'), 'text_to_video', 8)
+
     def test_cut_order_is_strict(self):
         for times in [('04','02'),('02','02')]:
             with self.assertRaises(h3.ContractError):

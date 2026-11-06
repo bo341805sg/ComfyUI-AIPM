@@ -1070,7 +1070,7 @@ class PromptAssistantTests(unittest.TestCase):
         self.assertEqual(final_package["generation_status"], "complete")
         self.assertEqual([item["segment_id"] for item in final_package["segments"]],
                          ["SEGMENT_001", "SEGMENT_002", "SEGMENT_003"])
-        self.assertEqual(resumed_calls, ["SEGMENT_002 提示词生成", "SEGMENT_003 提示词生成"])
+        self.assertEqual(resumed_calls, ["分段 2/3（SEGMENT_002）提示词生成", "分段 3/3（SEGMENT_003）提示词生成"])
 
     def test_video_node_returns_structured_package(self):
         node = nodes.AIPMVideoPromptCore()

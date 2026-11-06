@@ -492,6 +492,34 @@ def parse_reference_asset_manifest(source: str) -> list[dict[str, Any]]:
     return result
 
 
+def deduplicate_picture_profiles(package):
+    """Coalesce content-identical assets, keeping stable historical identities."""
+    result = copy.deepcopy(package)
+    profiles = result.get("reference_profiles") or []
+    seen, aliases, kept = {}, {}, []
+    for item in profiles:
+        digest = str(item.get("image_sha256") or "")
+        picture = str(item.get("picture_id") or "")
+        if digest and digest in seen:
+            aliases[picture] = seen[digest]
+        else:
+            kept.append(item)
+            if digest:
+                seen[digest] = picture
+    def remap(value):
+        if isinstance(value, str):
+            return re.sub(r"<Picture \d+>", lambda m: aliases.get(m.group(), m.group()), value)
+        if isinstance(value, list):
+            return [remap(x) for x in value]
+        if isinstance(value, dict):
+            return {k: remap(v) for k, v in value.items()}
+        return value
+    result = remap(result)
+    result["reference_profiles"] = remap(kept)
+    result["reference_count"] = len(kept)
+    return result
+
+
 class ReferenceAnalysisPipeline:
     """Shared staged media-analysis layer for every AIPM prompt node."""
 
@@ -1128,7 +1156,7 @@ class AIPMVideoPrompt:
                     "按segment_plan.keyframe_transitions逐区间描述相邻图片之间连续、物理可行的画面变化过程，不能只罗列静态图片",
                     "关键帧图片由Add Guide按帧注入，不是Ref2VA参考；提示词禁止输出<Picture N>或<Subject N>媒体标签，改用‘第N张关键帧图像’和具体帧号描述",
                 ])
-            prompt_context["rules"].append("生成分段编号与镜头编号是两套编号：每个分段的镜头编号都从[Shot 1]重新开始，不能沿用上一分段的[Shot 2]/[Shot 3]。视频延长也不等于切镜。单一连续镜头只写[Shot 1]；只有本分段内确实发生切镜才写[Shot 2]等，并使用At MM:SS.mmm指定该分段内的递增切镜时间。不得为通过格式校验而凭空增加切镜。")
+            prompt_context["rules"].append("每个[Shot N]镜头标题必须独立成行；正文引用前段镜头时使用普通文字，不重复方括号标题。生成分段编号与镜头编号是两套编号：每个分段的镜头编号都从[Shot 1]重新开始，不能沿用上一分段的[Shot 2]/[Shot 3]。视频延长也不等于切镜。单一连续镜头只写[Shot 1]；只有本分段内确实发生切镜才写[Shot 2]等，并使用At MM:SS.mmm指定该分段内的递增切镜时间。不得为通过格式校验而凭空增加切镜。")
             prompt_context["previous_end_state"] = str(prior_segment.get("ending_state") or "")
             prompt_context["rules"].extend(_h3_contract.inheritance_rules())
             prompt_context["rules"].append("逐段说明仅明确属性覆盖全局，其余继承；延长时保持previous_end_state中的动作接触与物体位置，不重新开始已完成动作。")
@@ -1292,6 +1320,9 @@ class AIPMVideoPrompt:
             package = copy.deepcopy(base_package)
             package["revision"] = int(base_package.get("revision") or 1) + 1
             package["segments"] = base_segments + appended
+            inherited_global_refs = set((package.get("global") or {}).get("reference_ids") or [])
+            for segment in appended:
+                segment["reference_ids"] = [ref for ref in segment.get("reference_ids", []) if ref not in inherited_global_refs]
             package["segment_count"] = len(base_segments) + segment_count
             package["total_duration"] = sum(float(item.get("duration") or duration_seconds) for item in package["segments"])
             package["generation_status"] = "complete" if append_complete else "interrupted"
@@ -1471,6 +1502,8 @@ class AIPMVideoPrompt:
             except json.JSONDecodeError as exc:
                 raise PromptAssistantError("没有可用于修改的上次有效结果") from exc
             candidate = self._authoring_data(candidate)
+            if operation == "append" and isinstance(candidate, dict):
+                candidate = deduplicate_picture_profiles(candidate)
             if operation in {"append", "revise_segment"}:
                 if not isinstance(candidate, dict) or not isinstance(candidate.get("segments"), list):
                     raise PromptAssistantError("续写或分段修改需要有效的AIPM时间轴缓存")
@@ -1490,7 +1523,8 @@ class AIPMVideoPrompt:
             if modification:
                 if not isinstance(candidate, dict) or not candidate.get("video_prompt"):
                     raise PromptAssistantError("没有可用于修改的上次有效结果")
-                previous = candidate if operation == "rewrite" else None
+                if operation == "rewrite":
+                    previous = candidate
             elif previous is None and isinstance(candidate, dict) and candidate.get("generation_status") == "interrupted":
                 previous = candidate
 
@@ -1527,15 +1561,25 @@ class AIPMVideoPrompt:
             if index < len(image_assets):
                 profile_item.update(image_assets[index])
         if operation == "append" and base_package:
-            # Each append submission's connected loaders describe the new
-            # segment. Provider ordinals must continue after the cached image
-            # profiles; reusing <Picture 1..N> would resolve the appended shot
-            # back to the first segment's assets when packages are merged.
+            # Reuse identities by image content; allocate new IDs only for new images.
             old_profiles = base_package.get("reference_profiles")
             old_profiles = old_profiles if isinstance(old_profiles, list) else []
-            picture_offset = len(old_profiles)
-            for index, item in enumerate(reference_profiles, 1):
-                item["picture_id"] = f"<Picture {picture_offset + index}>"
+            by_hash = {
+                str(item.get("image_sha256")): str(item.get("picture_id"))
+                for item in old_profiles if item.get("image_sha256") and item.get("picture_id")
+            }
+            ordinals = [int(match.group(1)) for item in old_profiles
+                        if (match := re.fullmatch(r"<Picture (\d+)>", str(item.get("picture_id") or "")))]
+            next_picture = max(ordinals, default=0) + 1
+            for item in reference_profiles:
+                image_hash = str(item.get("image_sha256") or "")
+                if image_hash and image_hash in by_hash:
+                    item["picture_id"] = by_hash[image_hash]
+                else:
+                    item["picture_id"] = f"<Picture {next_picture}>"
+                    next_picture += 1
+                    if image_hash:
+                        by_hash[image_hash] = item["picture_id"]
         # AIPM currently targets one H3 family; the separate generation-mode
         # widget owns the keyframe vs multimodal distinction.  Normalize old
         # persisted profile labels without changing their chosen mode.

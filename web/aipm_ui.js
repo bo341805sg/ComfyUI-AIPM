@@ -83,6 +83,44 @@ function writeTextToLinkedPreviews(node, output) {
   return updated;
 }
 
+function appendBaseFromLinkedTimeline(node, cached) {
+  const graph = node.graph || app.graph;
+  const output = node.outputs?.find(item => item.name === "完整结果 JSON");
+  const documents = [];
+  for (const id of output?.links || []) {
+    const link = graph?.links?.[id] || graph?.links?.get?.(id);
+    const target = link && graph.getNodeById?.(link.target_id);
+    if (target?.inputs?.[link.target_slot]?.name !== "timeline_json") continue;
+    const widget = target.widgets?.find(item => item.name === "timeline_state");
+    if (!widget) continue;
+    const document = JSON.parse(String(widget.value || "{}"));
+    if (Array.isArray(document.shots)) documents.push(document);
+  }
+  if (!documents.length) return cached;
+  if (documents.length !== 1) throw new Error("续写需明确连接一个时间轴。");
+  const document = documents[0];
+  const cachedDocument = JSON.parse(cached);
+  const authoring = cachedDocument.metadata?.aipm || cachedDocument;
+  const segments = authoring.segments || [];
+  const shots = document.shots;
+  if (!shots.length) throw new Error("当前时间轴为空，请使用重写时间轴。");
+  if (shots.length > segments.length || shots.some((shot, index) => String(shot.shot_id) !== String(segments[index]?.segment_id))) {
+    throw new Error("当前时间轴已重排或包含未知分段，无法安全匹配AIPM续写起点。");
+  }
+  if (shots.length === segments.length) return cached;
+  const base = JSON.parse(JSON.stringify(authoring));
+  base.segments = base.segments.slice(0, shots.length);
+  base.segment_count = shots.length;
+  base.total_duration = base.segments.reduce((total, segment) => total + Number(segment.duration || 0), 0);
+  base.generation_status = "complete";
+  base.resume_from_segment = null;
+  base.failed_segment_id = "";
+  base.interruption_error = "";
+  delete base.timeline_plan;
+  delete base.resume_key;
+  return JSON.stringify(base);
+}
+
 function writeResultToLinkedCineTimelines(node, rawTimelineJson, strategy = "rewrite", targetSegmentId = "") {
   const graph = node?.graph || app.graph;
   let raw = String(rawTimelineJson || "").trim();
@@ -134,11 +172,33 @@ function writeResultToLinkedCineTimelines(node, rawTimelineJson, strategy = "rew
         // Append must preserve the editor's complete existing document.
         const totalFrames = Math.max(existingEnd, ...additions.map((shot) => Number(shot.end_frame) || 0));
         const oldRefs = Array.isArray(current?.references) ? current.references : [];
-        const knownRefs = new Set(oldRefs.map((ref) => String(ref.reference_id || "")));
+        const assetKey = ref => {
+          const sha = ref.metadata?.sha256;
+          if (sha) return `sha:${sha}`;
+          if (ref.asset_id) return `asset:${ref.asset_id}`;
+          if (ref.filename) return JSON.stringify([ref.media_type, ref.storage_type, ref.subfolder, ref.filename]);
+          return `token:${ref.metadata?.provider_token || ref.reference_id}`;
+        };
+        const globalAssets = new Set(oldRefs.filter(ref => ref.scope === "global").map(assetKey));
+        const knownRefs = new Set(oldRefs.map(ref => JSON.stringify([assetKey(ref), ref.scope, ref.shot_id || ""])));
         const addedIds = new Set(additions.map((shot) => String(shot.shot_id || "")));
-        const newRefs = (parsed.references || []).filter((ref) =>
-          !knownRefs.has(String(ref.reference_id || "")) &&
-          (ref.scope === "global" || addedIds.has(String(ref.shot_id || ""))));
+        const newRefs = [];
+        for (const ref of parsed.references || []) {
+          const key = assetKey(ref);
+          if (globalAssets.has(key)) continue;
+          // A newly global asset is global only to this append, not the existing story.
+          const candidates = ref.scope === "global"
+            ? additions.map(shot => ({ ...ref, scope: "shot", shot_id: shot.shot_id,
+                reference_id: `${ref.reference_id}_${shot.shot_id}`,
+                start_frame: shot.start_frame, end_frame: shot.end_frame }))
+            : addedIds.has(String(ref.shot_id || "")) ? [ref] : [];
+          for (const candidate of candidates) {
+            const identity = JSON.stringify([key, candidate.scope, candidate.shot_id || ""]);
+            if (knownRefs.has(identity)) continue;
+            knownRefs.add(identity);
+            newRefs.push(candidate);
+          }
+        }
         next = { ...parsed, ...current, total_frames: totalFrames,
           shots: [...existing, ...additions],
           references: [...oldRefs.map((ref) => ref.scope === "global"
@@ -750,6 +810,7 @@ function installGeneratePanel(node) {
     node.constructor.nodeData ||= {};
     node.constructor.nodeData.output_node = true;
     node.mode = 0;
+    setStatus("提交阶段 1/2｜正在序列化工作流与参考素材……");
     const prompt = await app.graphToPrompt(activeGraph);
     const apiNodes = prompt?.output || {};
     let targetIds = executionTargets.filter((id) => apiNodes[String(id)]).map(String);
@@ -785,6 +846,7 @@ function installGeneratePanel(node) {
       }
     }
     prompt.output = Object.fromEntries(Object.entries(apiNodes).filter(([id]) => keep.has(String(id))));
+    setStatus("提交阶段 2/2｜正在向 ComfyUI /prompt 提交 AIPM 任务，尚未开始远程生成……");
     const queued = await app.api.queuePrompt(0, prompt);
     if (!queued?.prompt_id) throw new Error("AIPM提交未返回任务编号");
     requestState.activePromptId = String(queued.prompt_id);
@@ -846,6 +908,11 @@ function installGeneratePanel(node) {
       setStatus("请选择要修改的分段。", "error");
       return;
     }
+    let appendBase = String(node.properties?.aipm_previous_result || "");
+    if (isVideo && !revise && !hasInterruptedVideo() && operationFromLabel(operationSelect.value) === "append") {
+      try { appendBase = appendBaseFromLinkedTimeline(node, appendBase); }
+      catch (error) { setStatus(String(error.message || error), "error"); return; }
+    }
     requestState.running = true;
     requestState.activePromptId = "";
     requestState.pendingQueueEvents = [];
@@ -857,7 +924,7 @@ function installGeneratePanel(node) {
         operation: revise ? "revise_segment" : operationFromLabel(operationSelect.value),
         target_segment_id: revise ? (targetIdsByLabel.get(String(targetSelect.value)) || "") : "",
         instruction: originalModification,
-        previous_result: String(node.properties?.aipm_previous_result || ""),
+        previous_result: appendBase,
       });
     } else if (revise && modification) {
       modification.value = REVISION_MARKER + JSON.stringify({

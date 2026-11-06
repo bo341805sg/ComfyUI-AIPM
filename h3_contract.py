@@ -41,9 +41,13 @@ def validate_structure(text, mode, duration):
         raise ContractError('台词正文不能为空')
     body = dict(parts).get('detailed_description', dict(parts).get('integrated_multimodal_description',''))
     narrative = DIALOGUE.sub('', body)
-    shots = list(re.finditer(r'\[Shot\s+(\d+)\]', narrative))
+    # Explicit source-shot references are not target shot headers. Preserve
+    # offsets so cut-time validation still reads the original narrative.
+    header_text = re.sub(r'\((?:from|来自|承接)\s*\[Shot\s+\d+\]\)',
+                         lambda m: ' ' * len(m.group()), narrative, flags=re.I)
+    shots = list(re.finditer(r'\[Shot\s+(\d+)\]', header_text))
     if [int(s.group(1)) for s in shots] != list(range(1,len(shots)+1)) or not shots:
-        raise ContractError('镜头编号必须从[Shot 1]开始连续递增')
+        raise ContractError(f'镜头标题编号必须从[Shot 1]开始连续递增；识别到{[int(s.group(1)) for s in shots]}。每个片段重新从1编号，标题请独立成行；SEGMENT_006等分段编号不是镜头编号')
     previous = 0.0
     for i,shot in enumerate(shots):
         tail = narrative[shot.end():shots[i+1].start() if i+1<len(shots) else len(narrative)]
