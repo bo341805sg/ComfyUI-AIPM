@@ -435,3 +435,64 @@ def validate_description_language(text, language):
     prose = re.sub(r'“[^”]*”|「[^」]*」|"[^"\n]*"', '', prose)
     if len(re.findall(r'[\u3400-\u9fff]', prose)) >= 12:
         raise ContractError('已选择English，动作、镜头、场景和声音正文必须为英文；仅对白/歌词及画面文字保留原语言，中文对白使用<d>[Chinese]原文</d>。')
+
+
+def segment_format(mode):
+    fields = REF if mode == 'h3_ref2va' else BASE
+    body = 'detailed_description' if mode == 'h3_ref2va' else 'integrated_multimodal_description'
+    properties = {name: {'type': 'string'} for name in fields if name != body}
+    properties['shots'] = {'type': 'array', 'minItems': 1, 'items': {
+        'type': 'object', 'properties': {'start_seconds': {'type': 'number'}, 'description': {'type': 'string'}},
+        'required': ['start_seconds', 'description'], 'additionalProperties': False}}
+    if mode == 'h3_keyframe':
+        properties['needed_picture_ids'] = {'type': 'array', 'items': {'type': 'string'}}
+    return {'type': 'json_schema', 'json_schema': {'name': 'h3_segment', 'strict': True,
+        'schema': {'type': 'object', 'properties': properties, 'required': list(properties), 'additionalProperties': False}}}
+
+
+def compile_segment(data, mode, duration):
+    fields = REF if mode == 'h3_ref2va' else BASE
+    body = 'detailed_description' if mode == 'h3_ref2va' else 'integrated_multimodal_description'
+    shots = data.get('shots')
+    if not isinstance(shots, list) or not shots:
+        raise ContractError('结构化分段缺少镜头内容')
+    rendered, previous = [], -1
+    for index, shot in enumerate(shots):
+        start = shot.get('start_seconds')
+        description = shot.get('description')
+        if isinstance(start, bool) or not isinstance(start, (int, float)) or not 0 <= start < duration:
+            raise ContractError('镜头起始时间必须在当前片段内')
+        if (index == 0 and start != 0) or start <= previous:
+            raise ContractError('首镜头从0秒开始，后续切镜时间严格递增')
+        if not isinstance(description, str) or not description.strip():
+            raise ContractError('镜头描述不能为空')
+        if re.search(r'\[Shot\s+\d+\]', description):
+            raise ContractError('description只写镜头内容，不写Shot编号；编号由本地生成')
+        milliseconds = round(start * 1000)
+        minute, remainder = divmod(milliseconds, 60000)
+        second, fraction = divmod(remainder, 1000)
+        cue = '' if index == 0 else f' At {minute:02d}:{second:02d}.{fraction:03d},'
+        rendered.append(f'[Shot {index + 1}]{cue} {description.strip()}')
+        previous = start
+    output = []
+    for name in fields:
+        value = '\n'.join(rendered) if name == body else data.get(name)
+        if not isinstance(value, str) or not value.strip():
+            raise ContractError(f'结构化分段缺少字段：{name}')
+        output.append(f'{name}:\n{value.strip()}')
+    text = '\n'.join(output)
+    validate_structure(text, mode, duration)
+    return text
+
+
+def reconcile_loaded_pictures(text, active_references, available_pictures):
+    """Allow a segment to activate loaded pictures, never invent assets."""
+    active = list(dict.fromkeys(active_references))
+    available = {f'<Picture {int(m.group(1))}>' for value in available_pictures
+                 if (m := re.fullmatch(r'<Picture\s+(\d+)>', str(value), re.I))}
+    used = list(dict.fromkeys(f'<Picture {int(index)}>' for kind, index in MEDIA.findall(text)
+                              if kind.lower() == 'picture'))
+    unknown = [value for value in used if value not in active and value not in available]
+    if unknown:
+        raise ContractError('H3引用了未加载的图片：' + ', '.join(unknown))
+    return active + [value for value in used if value not in active]

@@ -360,6 +360,9 @@ class OpenAICompatibleClient:
         current = copy.deepcopy(payload)
         last_text = ""
         last_connection_error = None
+        last_validation_error = ""
+        failure_kind = "未知错误"
+        finish_reason = ""
         for attempt in range(attempts):
             _emit_aipm_stage(f"{stage}｜请求 {attempt + 1}/{attempts}，等待接口响应")
             try:
@@ -377,14 +380,22 @@ class OpenAICompatibleClient:
                 continue
             last_text = cls.content(response)
             validation_error = None
+            choices = response.get("choices") or []
+            finish_reason = str(choices[0].get("finish_reason") or "unknown") if choices else "unknown"
+            failure_kind = "JSON解析失败"
             try:
+                if finish_reason in {"length", "max_tokens"}:
+                    failure_kind = "输出额度耗尽（接口确认截断）"
+                    raise PromptAssistantError("接口返回finish_reason=" + finish_reason)
                 parsed = cls.parse_object(last_text)
                 if validator is not None:
+                    failure_kind = "内容或字段校验失败（JSON已解析）"
                     validator(parsed)
                 _emit_aipm_stage(f"{stage}｜响应校验通过")
                 return parsed, response
             except PromptAssistantError as exc:
                 validation_error = str(exc)
+                last_validation_error = validation_error
                 if attempt + 1 >= attempts:
                     break
                 finish_reason = ""
@@ -411,9 +422,8 @@ class OpenAICompatibleClient:
             raise PromptAssistantError(
                 f"{stage}连接远程服务连续失败 {attempts} 次：{last_connection_error}"
             ) from last_connection_error
-        excerpt = re.sub(r"\s+", " ", last_text)[:240] or "<empty>"
         raise PromptAssistantError(
-            f"{stage} 连续 {attempts} 次未返回有效 JSON（最后响应 {len(last_text)} 字符，可能被截断）；最后响应：{excerpt}"
+            f"{stage} 连续 {attempts} 次失败：{failure_kind}；具体原因：{last_validation_error}；finish_reason={finish_reason}；响应长度={len(last_text)}字符"
         )
 
     @classmethod
@@ -921,7 +931,7 @@ class AIPMVideoPrompt:
             plan_context["keyframe_rules"] = [
                 "逐张比较reference_profiles中的画面内容、动作阶段、构图与因果关系，再决定中间关键帧位置",
                 f"每个分段固定按24fps计算，共{frame_count}帧，合法局部帧为0到{frame_count - 1}",
-                "每个分段的keyframe_bindings必须包含全部图片，顺序必须与available_reference_ids中的Picture顺序一致",
+                "每个分段按本段需要选择非空图片子集，keyframe_bindings仅包含本段使用的图片，保持输入相对顺序；reference_ids与所选图片一致。未选图片不得注入本段；前段未使用的图片可以在后段首次启用",
                 "只有一张图片时固定local_frame=0；两张图片时固定为0和末帧",
                 "三张及以上时第一张固定0、最后一张固定末帧；中间图片根据动作与叙事所需时长选择严格递增的帧，不得机械均分",
                 "keyframe_transitions必须逐区间说明从当前图片到下一图片之间的可见动作、表演、镜头与画面演化，并明确对应起止帧",
@@ -965,8 +975,8 @@ class AIPMVideoPrompt:
                         raise PromptAssistantError("关键帧规划缺少keyframe_bindings")
                     ids = [str(item.get("reference_id") or "") for item in bindings if isinstance(item, dict)]
                     frames = [int(item.get("local_frame", -1)) for item in bindings if isinstance(item, dict)]
-                    if ids != expected_ids or len(frames) != len(expected_ids):
-                        raise PromptAssistantError("关键帧规划必须按图片输入顺序绑定全部参考图")
+                    if not ids or len(ids) != len(bindings) or len(set(ids)) != len(ids) or ids != [value for value in expected_ids if value in ids]:
+                        raise PromptAssistantError("关键帧规划必须选择有效且无重复的图片子集，并保持输入相对顺序")
                     if not frames or frames[0] != 0:
                         raise PromptAssistantError("第一张关键帧图片必须位于局部第0帧")
                     if len(frames) >= 2 and frames[-1] != last_frame:
@@ -1107,6 +1117,8 @@ class AIPMVideoPrompt:
                 if mode != "h3_ref2va" and image_reference_ids
                 else [str(value) for value in segment_plan.get("reference_ids", []) if str(value) in reference_ids]
             )
+            if mode == "h3_keyframe" and "keyframe_bindings" in segment_plan:
+                segment_refs = [str(item["reference_id"]) for item in segment_plan["keyframe_bindings"]]
             active_refs = list(dict.fromkeys(global_reference_ids + segment_refs))
             prior_segments = segment_results or (base_segments if operation == "append" else [])
             prior_segment = prior_segments[-1] if prior_segments else {}
@@ -1170,7 +1182,7 @@ class AIPMVideoPrompt:
             text_payload = {
                 "model": service_model,
                 "messages": [
-                    {"role": "system", "content": "你是MiniMax H3提示词导演。只返回当前分段的完整提示词纯文本。" + _h3_contract.description_language_rule(requested_language)},
+                    {"role": "system", "content": "你是MiniMax H3提示词导演。返回当前分段的结构化JSON，遵守response_format。除动作正文外，原H3字段保持不变；动作正文改为shots数组，每项start_seconds为本段局部起始秒数、description为完整动作对白与声音描述。第一项从0秒开始；只有真实切镜才增加下一项，连续动作默认只有一项。不要输出Shot编号或At切镜前缀，由本地编译；示例仅用于内容和风格，忽略此前要求的纯文本输出格式。" + _h3_contract.description_language_rule(requested_language)},
                     {"role": "user", "content": [{"type": "text", "text": json.dumps(prompt_context, ensure_ascii=False)}]},
                 ],
                 "temperature": 0.1, "max_tokens": 3200, "cache_prompt": True,
@@ -1197,7 +1209,9 @@ class AIPMVideoPrompt:
                     if len(current_body) > 200 and current_body == prior_body:
                         raise PromptAssistantError("当前段动作正文与上一段完全重复；请根据当前segment_plan的brief和结尾重新生成本段，前段仅作衔接，不能复述。")
                 try:
-                    _h3_contract.validate_segment(text, planned_dialogue, active_refs, mode)
+                    checked_refs = (_h3_contract.reconcile_loaded_pictures(text, active_refs, image_reference_ids)
+                                    if mode == "h3_ref2va" else active_refs)
+                    _h3_contract.validate_segment(text, planned_dialogue, checked_refs, mode)
                 except _h3_contract.ContractError as exc:
                     raise PromptAssistantError(str(exc)) from exc
                 if mode == "h3_keyframe" and image_reference_ids:
@@ -1214,10 +1228,60 @@ class AIPMVideoPrompt:
                     if missing_frames:
                         raise PromptAssistantError(f"关键帧提示词没有明确描述帧位：{missing_frames}")
             try:
-                segment_prompt, segment_response = OpenAICompatibleClient.request_text(
-                    service_url, text_payload, f"分段 {index + 1}/{len(segments_plan)}（{segment_id}）提示词生成", attempts=2,
-                    validator=validate_segment_text,
-                )
+                if mode == "h3_keyframe":
+                    prompt_context["available_keyframe_profiles"] = reference_profiles
+                    prompt_context["rules"].append("若需要本段未绑定的已加载图片，在needed_picture_ids列出其Picture标识，由规划器补充帧位；否则返回空数组。禁止在正文使用Picture标签或自行编造帧位。")
+                    text_payload["messages"][1]["content"][0]["text"] = json.dumps(prompt_context, ensure_ascii=False)
+                text_payload["response_format"] = _h3_contract.segment_format(mode)
+                def validate_structured_segment(candidate):
+                    needed = candidate.get("needed_picture_ids", []) if mode == "h3_keyframe" else []
+                    if needed:
+                        if not isinstance(needed, list) or any(value not in image_reference_ids for value in needed):
+                            raise PromptAssistantError("新增关键帧请求包含未加载图片")
+                        if not any(value not in active_refs for value in needed):
+                            raise PromptAssistantError("已有绑定图片无需再次请求；needed_picture_ids应为空")
+                        return
+                    try:
+                        compiled = _h3_contract.compile_segment(candidate, mode, duration_seconds)
+                    except _h3_contract.ContractError as exc:
+                        raise PromptAssistantError(str(exc)) from exc
+                    validate_segment_text(compiled)
+                for allocation_attempt in range(2):
+                    segment_data, segment_response = OpenAICompatibleClient.request_object(
+                        service_url, text_payload, f"分段 {index + 1}/{len(segments_plan)}（{segment_id}）结构化提示词生成", attempts=2,
+                        validator=validate_structured_segment,
+                    )
+                    needed = segment_data.get("needed_picture_ids", []) if mode == "h3_keyframe" else []
+                    if not needed:
+                        break
+                    if allocation_attempt:
+                        raise PromptAssistantError("关键帧补充规划后仍请求新增图片，已保留完成片段，请复核当前段规划")
+                    required_ids = list(dict.fromkeys(active_refs + needed))
+                    repair_payload = copy.deepcopy(plan_payload)
+                    repair_payload["response_format"] = self.timeline_plan_format(1)
+                    repair_payload["messages"] = [{"role": "system", "content": "只修复当前段关键帧规划，返回一个分段的规划JSON；保留剧情、逐字对白、时长及已有图片。按输入顺序绑定required_ids全部图片，首图0帧、末图末帧、中间帧严格递增，并补全逐区间过渡。不得修改其他片段。"},
+                        {"role": "user", "content": json.dumps({"segment": segment_plan, "required_ids": required_ids, "available_profiles": reference_profiles, "duration_seconds": duration_seconds, "fps": 24}, ensure_ascii=False)}]
+                    def validate_repair(candidate):
+                        entries = candidate.get("segments")
+                        if not isinstance(entries, list) or len(entries) != 1:
+                            raise PromptAssistantError("关键帧补充规划必须仅返回当前一段")
+                        repaired = entries[0]
+                        if set(required_ids) != {item.get("reference_id") for item in repaired.get("keyframe_bindings", [])}:
+                            raise PromptAssistantError("关键帧补充规划必须保留已有图片并绑定新增图片")
+                        if repaired.get("dialogue_lines", []) != segment_plan.get("dialogue_lines", []):
+                            raise PromptAssistantError("关键帧补充规划不得改写已规划对白")
+                        trial = copy.deepcopy(plan)
+                        trial["segments"][index] = repaired
+                        validate_plan(trial)
+                    repaired, repair_response = OpenAICompatibleClient.request_object(service_url, repair_payload, "补充当前段关键帧规划", attempts=2, validator=validate_repair)
+                    usage_records.append(repair_response.get("usage") or {})
+                    segment_plan.clear()
+                    segment_plan.update(repaired["segments"][0])
+                    segment_refs = [item["reference_id"] for item in segment_plan["keyframe_bindings"]]
+                    active_refs = list(segment_refs)
+                    prompt_context.update(segment_plan=segment_plan, active_reference_ids=active_refs, reference_profiles=[item for item in reference_profiles if item["picture_id"] in active_refs])
+                    text_payload["messages"][1]["content"][0]["text"] = json.dumps(prompt_context, ensure_ascii=False)
+                segment_prompt = _h3_contract.compile_segment(segment_data, mode, duration_seconds)
                 source_prompt = segment_prompt
                 role_bindings = (_h3_contract.resolved_role_bindings(
                     source_prompt, reference_profiles, planned_dialogue, previous_roles,
@@ -1230,7 +1294,12 @@ class AIPMVideoPrompt:
                 )
                 self.validate_h3_structure(compiled_prompt, mode, duration_seconds)
                 try:
-                    _h3_contract.validate_segment(compiled_prompt, planned_dialogue, active_refs, mode)
+                    final_refs = (_h3_contract.reconcile_loaded_pictures(source_prompt + "\n" + compiled_prompt, active_refs, image_reference_ids)
+                                  if mode == "h3_ref2va" else active_refs)
+                    _h3_contract.validate_segment(compiled_prompt, planned_dialogue, final_refs, mode)
+                    active_refs = final_refs
+                    if mode == "h3_ref2va":
+                        segment_refs = [value for value in active_refs if value not in global_reference_ids]
                 except _h3_contract.ContractError as exc:
                     raise PromptAssistantError(str(exc)) from exc
             except PromptAssistantError as exc:
@@ -2332,8 +2401,12 @@ class AIPMCineTimelineAdapter:
                         item for item in source_segments[index].get("keyframe_bindings", [])
                         if isinstance(item, dict) and str(item.get("reference_id") or "") == reference_id
                     ), None)
-                    last_index = max(1, len(profiles) - 1)
-                    fallback_local = round(image_index * max(0, end - start - 1) / last_index)
+                    bindings = source_segments[index].get("keyframe_bindings")
+                    selected = ([str(item["reference_id"]) for item in bindings] if bindings is not None else
+                                [str(item["picture_id"]) for item in profiles if str(item["picture_id"]) in source_segments[index].get("effective_reference_ids", [])])
+                    local_index = selected.index(reference_id)
+                    last_index = max(1, len(selected) - 1)
+                    fallback_local = round(local_index * max(0, end - start - 1) / last_index)
                     local_frame = int(planned.get("local_frame", fallback_local)) if planned else fallback_local
                     local_frame = max(0, min(max(0, end - start - 1), local_frame))
                     frame = start + local_frame
@@ -2341,12 +2414,12 @@ class AIPMCineTimelineAdapter:
                     record["keyframe_local_frame"] = local_frame
                     record["keyframe_placement_reason"] = str((planned or {}).get("placement_reason") or "")
                     record["keyframe_role"] = (
-                        "first" if image_index == 0 else
-                        "last" if image_index == len(profiles) - 1 else "guide"
+                        "first" if local_index == 0 else
+                        "last" if local_index == len(selected) - 1 else "guide"
                     )
                     record["type"] = (
-                        "first_frame" if image_index == 0 else
-                        "last_frame" if image_index == len(profiles) - 1 else "guide"
+                        "first_frame" if local_index == 0 else
+                        "last_frame" if local_index == len(selected) - 1 else "guide"
                     )
                 references.append(record)
 
