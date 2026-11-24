@@ -503,19 +503,24 @@ def parse_reference_asset_manifest(source: str) -> list[dict[str, Any]]:
 
 
 def deduplicate_picture_profiles(package):
-    """Coalesce content-identical assets, keeping stable historical identities."""
+    """Coalesce identical assets and renumber every package reference together."""
     result = copy.deepcopy(package)
     profiles = result.get("reference_profiles") or []
-    seen, aliases, kept = {}, {}, []
+    seen, assets, aliases, kept = {}, {}, {}, []
     for item in profiles:
         digest = str(item.get("image_sha256") or "")
         picture = str(item.get("picture_id") or "")
-        if digest and digest in seen:
-            aliases[picture] = seen[digest]
-        else:
+        asset = str(item.get("asset_id") or "")
+        canonical = seen.get(digest) if digest else None
+        canonical = canonical or (assets.get(asset) if asset else None)
+        if canonical is None:
+            canonical = f"<Picture {len(kept) + 1}>"
             kept.append(item)
-            if digest:
-                seen[digest] = picture
+        aliases[picture] = canonical
+        if digest:
+            seen[digest] = canonical
+        if asset:
+            assets[asset] = canonical
     def remap(value):
         if isinstance(value, str):
             return re.sub(r"<Picture \d+>", lambda m: aliases.get(m.group(), m.group()), value)
@@ -528,6 +533,33 @@ def deduplicate_picture_profiles(package):
     result["reference_profiles"] = remap(kept)
     result["reference_count"] = len(kept)
     return result
+
+
+def merge_picture_profiles(previous, incoming):
+    """Retain established Picture IDs and register newly connected assets."""
+    profiles = copy.deepcopy(previous or [])
+    by_asset = {p["asset_id"]: p for p in profiles if p.get("asset_id")}
+    by_hash = {p["image_sha256"]: p for p in profiles if p.get("image_sha256")}
+    ordinals = [
+        int(match.group(1)) for p in profiles
+        if (match := re.fullmatch(r"<Picture (\d+)>", str(p.get("picture_id") or "")))
+    ]
+    next_picture = max(ordinals, default=0) + 1
+    for original in incoming:
+        item = copy.deepcopy(original)
+        asset = item.get("asset_id")
+        digest = item.get("image_sha256")
+        existing = by_asset.get(asset) or by_hash.get(digest)
+        if existing is None:
+            item["picture_id"] = f"<Picture {next_picture}>"
+            next_picture += 1
+            profiles.append(item)
+            existing = item
+        if asset:
+            by_asset[asset] = existing
+        if digest:
+            by_hash[digest] = existing
+    return profiles
 
 
 class ReferenceAnalysisPipeline:
@@ -880,6 +912,9 @@ class AIPMVideoPrompt:
             "segment_count": segment_count, "aspect_ratio": aspect_ratio,
             "requested_language": requested_language,
             "reference_ids": reference_ids,
+            "picture_assets": [(p.get("picture_id"), p.get("asset_id"), p.get("image_sha256"))
+                               for p in reference_profiles],
+            "operation": operation, "append_offset": append_offset, "target_segment_id": target_segment_id,
         }, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
         resumable = bool(
             isinstance(previous, dict)
@@ -921,6 +956,13 @@ class AIPMVideoPrompt:
         }
         plan_context["h3_planning_rules"] = _h3_contract.planning_rules()
         plan_context["inheritance_rules"] = _h3_contract.inheritance_rules()
+        if mode == "h3_ref2va" and base_package and operation in {"append", "revise_segment"}:
+            plan_context["inherited_global_reference_ids"] = (base_package.get("global") or {}).get("reference_ids", [])
+            plan_context["promotion_rules"].append(
+                "续写或修改分段不得新增整条时间轴的全局参考。"
+                "继承已有全局参考；其他参考只在实际使用它的分段 reference_ids 中列出，"
+                "即使所有本轮分段都使用，也不要提升到全局。"
+            )
         plan_context.setdefault("rules", []).extend([
             "按整体描述的事件顺序规划各段；只把本段动作与对白写进本段，前段内容用于衔接。",
             "每段opening_state/ending_state写明人物位置朝向、手与物体接触、道具位置、动作阶段和持续声音；延长段的起始状态必须承接上一段结束状态。",
@@ -1065,19 +1107,27 @@ class AIPMVideoPrompt:
         global_negative = str(plan.get("global_negative_prompt") or "").strip()
         global_reference_ids = [str(value) for value in plan.get("global_reference_ids", []) if str(value) in reference_ids]
         if base_package and operation in {"append", "revise_segment"}:
+            planned_global_reference_ids = global_reference_ids
             base_global = base_package.get("global") if isinstance(base_package.get("global"), dict) else {}
             global_prompt = str(base_global.get("prompt") or global_prompt)
             global_negative = str(base_global.get("negative_prompt") or global_negative)
             global_reference_ids = [
                 str(value) for value in base_global.get("reference_ids", []) if str(value)
             ]
+            if mode == "h3_ref2va":
+                # A planner sees only the new or revised segments. Its globals
+                # outside the inherited set belong to those segments only.
+                for segment in segments_plan:
+                    segment["reference_ids"] = list(dict.fromkeys(
+                        (segment.get("reference_ids") or []) + planned_global_reference_ids
+                    ))
         # Only multimodal mode has true timeline-global references.  In the
         # three image-sequenced modes, every connected image is attached to
         # every concrete segment in connector order; the adapter decides
         # whether those ordered images are ordinary, boundary, or keyframes.
         if mode != "h3_ref2va":
             global_reference_ids = []
-        elif segments_plan:
+        elif segments_plan and operation == "rewrite":
             # The planner may leave a reference on every segment instead of
             # promoting it.  Timeline-wide intersection is authoritative:
             # references used by every segment belong to the global scope.
@@ -1168,7 +1218,7 @@ class AIPMVideoPrompt:
                     "按segment_plan.keyframe_transitions逐区间描述相邻图片之间连续、物理可行的画面变化过程，不能只罗列静态图片",
                     "关键帧图片由Add Guide按帧注入，不是Ref2VA参考；提示词禁止输出<Picture N>或<Subject N>媒体标签，改用‘第N张关键帧图像’和具体帧号描述",
                 ])
-            prompt_context["rules"].append("每个[Shot N]镜头标题必须独立成行；正文引用前段镜头时使用普通文字，不重复方括号标题。生成分段编号与镜头编号是两套编号：每个分段的镜头编号都从[Shot 1]重新开始，不能沿用上一分段的[Shot 2]/[Shot 3]。视频延长也不等于切镜。单一连续镜头只写[Shot 1]；只有本分段内确实发生切镜才写[Shot 2]等，并使用At MM:SS.mmm指定该分段内的递增切镜时间。不得为通过格式校验而凭空增加切镜。")
+            prompt_context["rules"].append("在结构化JSON中，shots每项只写本段局部start_seconds和description。description不写镜头编号、标题或At切镜时间前缀；编号和时间前缀由编译器生成。视频延长不等于切镜：单一连续镜头只返回一项，start_seconds为0；只有本段确实发生切镜才增加一项，start_seconds严格递增。")
             prompt_context["previous_end_state"] = str(prior_segment.get("ending_state") or "")
             prompt_context["rules"].extend(_h3_contract.inheritance_rules())
             prompt_context["rules"].append("逐段说明仅明确属性覆盖全局，其余继承；延长时保持previous_end_state中的动作接触与物体位置，不重新开始已完成动作。")
@@ -1413,6 +1463,7 @@ class AIPMVideoPrompt:
                 if str(item.get("picture_id") or "") not in known_profile_ids
             )
             package["reference_count"] = len(package.get("reference_profiles") or [])
+            package = deduplicate_picture_profiles(package)
             package.setdefault("media_assets", {"videos": [], "audios": []})
             for key in ("videos", "audios"):
                 existing_ids = {
@@ -1447,6 +1498,9 @@ class AIPMVideoPrompt:
             package = copy.deepcopy(base_package)
             package["revision"] = int(base_package.get("revision") or 1) + 1
             package["segments"][target_index] = revised
+            if mode == "h3_ref2va":
+                package["reference_profiles"] = copy.deepcopy(reference_profiles)
+                package["reference_count"] = len(reference_profiles)
             package["generation_status"] = "complete"
             package["resume_from_segment"] = None
             package["failed_segment_id"] = ""
@@ -1629,7 +1683,11 @@ class AIPMVideoPrompt:
         for index, profile_item in enumerate(reference_profiles):
             if index < len(image_assets):
                 profile_item.update(image_assets[index])
-        if operation == "append" and base_package:
+        profile = "MiniMax H3"
+        mode = self._resolve_mode(profile, str(生成模式), len(reference_profiles), bool(connected_video_count), bool(connected_audio_count))
+        if base_package and mode == "h3_ref2va":
+            reference_profiles = merge_picture_profiles(base_package.get("reference_profiles"), reference_profiles)
+        elif operation == "append" and base_package:
             # Reuse identities by image content; allocate new IDs only for new images.
             old_profiles = base_package.get("reference_profiles")
             old_profiles = old_profiles if isinstance(old_profiles, list) else []
@@ -1637,23 +1695,29 @@ class AIPMVideoPrompt:
                 str(item.get("image_sha256")): str(item.get("picture_id"))
                 for item in old_profiles if item.get("image_sha256") and item.get("picture_id")
             }
+            by_asset = {
+                str(item.get("asset_id")): str(item.get("picture_id"))
+                for item in old_profiles if item.get("asset_id") and item.get("picture_id")
+            }
             ordinals = [int(match.group(1)) for item in old_profiles
                         if (match := re.fullmatch(r"<Picture (\d+)>", str(item.get("picture_id") or "")))]
             next_picture = max(ordinals, default=0) + 1
             for item in reference_profiles:
                 image_hash = str(item.get("image_sha256") or "")
-                if image_hash and image_hash in by_hash:
-                    item["picture_id"] = by_hash[image_hash]
+                asset_id = str(item.get("asset_id") or "")
+                existing = by_asset.get(asset_id) or by_hash.get(image_hash)
+                if existing:
+                    item["picture_id"] = existing
                 else:
                     item["picture_id"] = f"<Picture {next_picture}>"
                     next_picture += 1
-                    if image_hash:
-                        by_hash[image_hash] = item["picture_id"]
+                if image_hash:
+                    by_hash[image_hash] = item["picture_id"]
+                if asset_id:
+                    by_asset[asset_id] = item["picture_id"]
         # AIPM currently targets one H3 family; the separate generation-mode
         # widget owns the keyframe vs multimodal distinction.  Normalize old
         # persisted profile labels without changing their chosen mode.
-        profile = "MiniMax H3"
-        mode = self._resolve_mode(profile, str(生成模式), len(reference_profiles), bool(connected_video_count), bool(connected_audio_count))
         if mode != "h3_ref2va" and (connected_video_count or connected_audio_count):
             raise PromptAssistantError("只有多模态模式接受视频或声音参考；其他模式仅按顺序绑定参考图片")
         if mode == "h3_fl2va" and len(reference_profiles) > 2:

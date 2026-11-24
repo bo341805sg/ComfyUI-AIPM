@@ -466,6 +466,13 @@ def compile_segment(data, mode, duration):
             raise ContractError('首镜头从0秒开始，后续切镜时间严格递增')
         if not isinstance(description, str) or not description.strip():
             raise ContractError('镜头描述不能为空')
+        # Some model responses repeat the heading that the compiler supplies.
+        description = re.sub(
+            r'^(?:\[Shot\s+\d+\]\s*[:：]?\s*)+', '', description.strip(),
+            flags=re.IGNORECASE,
+        )
+        if not description:
+            raise ContractError('镜头描述不能为空')
         if re.search(r'\[Shot\s+\d+\]', description):
             raise ContractError('description只写镜头内容，不写Shot编号；编号由本地生成')
         milliseconds = round(start * 1000)

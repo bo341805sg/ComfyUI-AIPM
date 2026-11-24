@@ -11,6 +11,83 @@ SPEC.loader.exec_module(nodes)
 
 
 class PromptAssistantTests(unittest.TestCase):
+    def test_append_keeps_cached_picture_ids_and_scopes_new_references(self):
+        from unittest.mock import patch
+
+        old = [{"picture_id": f"<Picture {i}>", "asset_id": f"old{i}.png"} for i in range(1, 5)]
+        base = {
+            "schema": "aipm_video_timeline",
+            "generation_mode": "h3_ref2va", "global": {"reference_ids": ["<Picture 1>"]},
+            "reference_profiles": old, "video_prompt": "已有提示", "negative_prompt": "", "audio_prompt": "",
+            "segments": [{"segment_id": f"SEGMENT_{i:03d}", "duration": 5,
+                          "timeline_local_prompt": "已有画面", "compiled_prompt": "已有画面",
+                          "effective_reference_ids": ["<Picture 1>"]} for i in range(1, 8)],
+        }
+        plan = {
+            "global_reference_ids": ["<Picture 5>"],
+            "segments": [{"brief": "蓝色方块出现", "reference_ids": []},
+                         {"brief": "蓝色方块继续移动", "reference_ids": []}],
+        }
+        seen = []
+
+        def respond(url, payload, stage, **kwargs):
+            if not stage.startswith("分段 "):
+                return plan, {}
+            context = json.loads(payload["messages"][1]["content"][0]["text"])
+            seen.append(context["active_reference_ids"])
+            picture = "<Picture 4>" if len(seen) == 1 else "<Picture 5>"
+            data = {
+                "subject_definitions": f"<Subject 1> 是 {picture} 中的蓝色方块。",
+                "summary": "蓝色方块缓慢移动。",
+                "retention_analysis": "<Subject 1> 的颜色为 fully_preserved。",
+                "shots": [{"start_seconds": 0, "description": "<Subject 1> 沿桌面滑动后停稳。"}],
+                "overall_soundscape": "轻微摩擦声。", "non_diegetic_music": "N/A",
+            }
+            kwargs["validator"](data)
+            return data, {}
+
+        marker = '__AIPM_RUN_V2__{"operation":"append"}'
+        with patch.object(nodes, "encode_image_batch", side_effect=lambda image, **_: [{}] if image else []), \
+             patch.object(nodes.ReferenceAnalysisPipeline, "analyze_images",
+                          return_value=([{"picture_id": "<Picture 1>"}], 0)), \
+             patch.object(nodes.OpenAICompatibleClient, "request_object", side_effect=respond):
+            generate = inspect.unwrap(nodes.AIPMVideoPromptCore.generate)
+            result = generate(
+                nodes.AIPMVideoPromptCore(), "蓝色方块移动", "http://host/v1", "model", "MiniMax H3", "多模态",
+                5, "16:9", "中文（推荐）", 2, image1=True, 修改意见=marker,
+                上次结果JSON=json.dumps(base),
+                参考素材清单JSON='[{"asset_id":"new.png","media_type":"image"}]',
+            )
+        timeline = result["result"][0]
+        package = timeline["metadata"]["aipm"]
+        self.assertEqual(package["generation_status"], "complete", package.get("interruption_error"))
+        self.assertEqual(seen, [["<Picture 1>", "<Picture 5>"]] * 2)
+        self.assertEqual(package["global"]["reference_ids"], ["<Picture 1>"])
+        self.assertEqual([(r["asset_id"], r["scope"], r["shot_id"]) for r in timeline["references"]
+                          if r["asset_id"] in {"old4.png", "new.png"}],
+                         [("old4.png", "shot", "SEGMENT_008"),
+                          ("new.png", "shot", "SEGMENT_008"), ("new.png", "shot", "SEGMENT_009")])
+
+    def test_picture_profiles_compact_and_reuse_asset_identity(self):
+        package = {
+            "reference_profiles": [
+                {"picture_id": "<Picture 1>", "asset_id": "a", "image_sha256": "old"},
+                {"picture_id": "<Picture 3>", "asset_id": "b"},
+                {"picture_id": "<Picture 5>", "asset_id": "a", "image_sha256": "new"},
+                {"picture_id": "<Picture 6>", "asset_id": "c"},
+                {"picture_id": "<Picture 8>", "asset_id": "d"},
+            ],
+            "segments": [{"prompt": "<Picture 5> <Picture 8>",
+                          "reference_ids": ["<Picture 3>"]}],
+        }
+        result = nodes.deduplicate_picture_profiles(package)
+        self.assertEqual([p["picture_id"] for p in result["reference_profiles"]],
+                         [f"<Picture {i}>" for i in range(1, 5)])
+        self.assertEqual(result["segments"][0]["prompt"], "<Picture 1> <Picture 4>")
+        self.assertEqual(result["segments"][0]["reference_ids"], ["<Picture 2>"])
+        self.assertEqual(nodes.deduplicate_picture_profiles(result), result)
+        self.assertEqual(package["reference_profiles"][1]["picture_id"], "<Picture 3>")
+
     def test_reference_cache_separates_request_context(self):
         from unittest.mock import patch
         nodes.ReferenceAnalysisPipeline._image_cache.clear()

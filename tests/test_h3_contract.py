@@ -10,6 +10,29 @@ def base(body):
     return f'integrated_multimodal_description: {body}\n\noverall_soundscape: 雨声\n\nnon_diegetic_music: N/A'
 
 class H3ContractTests(unittest.TestCase):
+    def test_compile_normalizes_redundant_shot_prefixes_using_array_order(self):
+        text = h3.compile_segment({
+            'shots': [
+                {'start_seconds': 0, 'description': '  [Shot 8]：\n母亲 (S1) 说：<d>[Chinese] 等一下。</d>'},
+                {'start_seconds': 2.5, 'description': '[shot 9]: [Shot 2] 女儿转身。'},
+            ],
+            'overall_soundscape': '雨声', 'non_diegetic_music': 'N/A',
+        }, 'text_to_video', 5)
+        self.assertIn('[Shot 1] 母亲 (S1) 说：<d>[Chinese] 等一下。</d>', text)
+        self.assertIn('[Shot 2] At 00:02.500, 女儿转身。', text)
+        self.assertNotIn('[Shot 8]', text)
+
+    def test_compile_requires_content_and_rejects_embedded_cut(self):
+        for description, error in (
+            ('[Shot 7]:', '镜头描述不能为空'),
+            ('女儿转身。[Shot 2] 突然切镜。', 'description只写镜头内容'),
+        ):
+            with self.subTest(description=description), self.assertRaisesRegex(h3.ContractError, error):
+                h3.compile_segment({
+                    'shots': [{'start_seconds': 0, 'description': description}],
+                    'overall_soundscape': '雨声', 'non_diegetic_music': 'N/A',
+                }, 'text_to_video', 5)
+
     def test_split_utterance_keeps_actor_and_words(self):
         source=base('[Shot 1] 母亲说：<d>[Chinese] 等一下。</d> 她接着说：<d>[Chinese] 看这里。</d> 女儿回答：<d>[Chinese] 好。</d>')
         bound=h3.bind_dialogue(source,['母亲：等一下。看这里。','女儿：好。'])
